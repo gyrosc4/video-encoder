@@ -1,36 +1,23 @@
-name: Kick VOD → AV1 720p (first 90 min)
+name: Kick VOD to AV1 720p
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Kick VOD URL (https://kick.com/<channel>/videos/<id>)"
+        description: "Kick VOD link (kick.com/CHANNEL/videos/ID)"
         required: true
         type: string
       minutes:
-        description: "Minutes to keep from the start"
+        description: "Minutes to keep from the start (type 5 for a quick test)"
         default: "90"
-      height:
-        description: "Max height (download + output)"
+        type: string
+      quality:
+        description: "small = tiniest file | balanced = recommended | keep60 = keep 60fps (slow)"
         type: choice
-        default: "720"
-        options: ["720", "480", "360"]
-      crf:
-        description: "SVT-AV1 CRF — lower = better looking / bigger (28–36)"
-        default: "32"
-      preset:
-        description: "SVT-AV1 preset — lower = slower / smaller"
-        type: choice
-        default: "6"
-        options: ["8", "7", "6", "5", "4"]
-      fps:
-        description: "Output fps (0 = keep source; 30 shrinks 60fps a lot)"
-        default: "0"
-      audio_kbps:
-        description: "Opus audio bitrate"
-        default: "64"
+        default: "balanced"
+        options: ["small", "balanced", "keep60"]
       publish_release:
-        description: "Also attach file to a GitHub Release (artifacts expire)"
+        description: "Also put the file in a GitHub Release (permanent download link)"
         type: boolean
         default: false
 
@@ -45,42 +32,67 @@ defaults:
 jobs:
   rip:
     runs-on: ubuntu-latest
-    timeout-minutes: 350          # hard GitHub cap is 360
+    timeout-minutes: 350
     permissions:
-      contents: write             # only needed for the optional release upload
+      contents: write
     env:
       URL: ${{ inputs.url }}
       MINUTES: ${{ inputs.minutes }}
-      HEIGHT: ${{ inputs.height }}
-      CRF: ${{ inputs.crf }}
-      PRESET: ${{ inputs.preset }}
-      FPS: ${{ inputs.fps }}
-      AB: ${{ inputs.audio_kbps }}
+      QUALITY: ${{ inputs.quality }}
 
     steps:
-      # PATCHED: no `find /tmp` (permission-denied → exit 1), no `grep -q` (SIGPIPE)
-      - name: Install ffmpeg (static, libsvtav1) + yt-dlp nightly
+      - name: 1. Settings
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/bin" /tmp/ff
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          curl -fsSL -o /tmp/ff.tar.xz \
-            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
-          tar -xf /tmp/ff.tar.xz -C /tmp/ff --strip-components=1
-          install -m755 /tmp/ff/bin/ffmpeg  "$HOME/bin/ffmpeg"
-          install -m755 /tmp/ff/bin/ffprobe "$HOME/bin/ffprobe"
-          rm -rf /tmp/ff /tmp/ff.tar.xz
-          curl -fsSL -o "$HOME/bin/yt-dlp" \
-            https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp
-          chmod +x "$HOME/bin/yt-dlp"
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep libsvtav1 > /dev/null \
-            || { echo "no SVT-AV1 encoder!"; exit 1; }
-          ffmpeg -version | head -n1
-          yt-dlp --version
+          M=${MINUTES//[^0-9]/}; M=${M:-90}
+          [ "$M" -ge 1 ] || M=90
+          case "$QUALITY" in
+            small)    CRF=35; PRESET=8; FPS=30 ;;
+            keep60)   CRF=32; PRESET=6; FPS=0  ;;
+            *)        CRF=32; PRESET=6; FPS=30 ;;
+          esac
+          {
+            echo "MINUTES=$M"
+            echo "CUT_SECONDS=$((M*60))"
+            printf 'END=%02d:%02d:%02d\n' $((M/60)) $((M%60)) 0
+            echo "CRF=$CRF"
+            echo "PRESET=$PRESET"
+            echo "FPS=$FPS"
+          } >> "$GITHUB_ENV"
+          echo "Keeping $M min | CRF $CRF | preset $PRESET | fps $FPS"
 
-      - name: Cookies (optional — sub-only / logged-in VODs)
+      - name: 2. Install ffmpeg (AV1) + yt-dlp, then self-test
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/bin:$PATH"
+          cd /tmp
+          mkdir -p ff
+          echo "--- downloading ffmpeg ---"
+          curl -fsSL --retry 5 --retry-delay 5 -o ff.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf ff.tar.xz -C ff --strip-components=1
+          sudo install -m755 ff/bin/ffmpeg  /usr/local/bin/ffmpeg
+          sudo install -m755 ff/bin/ffprobe /usr/local/bin/ffprobe
+          rm -rf ff ff.tar.xz
+          echo "--- downloading yt-dlp ---"
+          curl -fsSL --retry 5 --retry-delay 5 -o yt-dlp \
+            https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp
+          sudo install -m755 yt-dlp /usr/local/bin/yt-dlp
+          rm -f yt-dlp
+          hash -r
+          echo "ffmpeg = $(command -v ffmpeg)"
+          echo "yt-dlp = $(command -v yt-dlp)"
+          ffmpeg -hide_banner -version > v.txt; head -n1 v.txt
+          yt-dlp --version
+          echo "--- AV1 self-test (1 second) ---"
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi -i "testsrc=size=320x240:rate=30" -t 1 \
+            -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 40 -f null -
+          echo "AV1 ENCODER WORKS"
+
+      - name: 3. Cookies (only if you added a KICK_COOKIES secret)
         env:
-          KICK_COOKIES: ${{ secrets.KICK_COOKIES }}   # Netscape cookies.txt as a repo secret
+          KICK_COOKIES: ${{ secrets.KICK_COOKIES }}
         run: |
           set -euo pipefail
           printf '# Netscape HTTP Cookie File\n' > "$RUNNER_TEMP/cookies.txt"
@@ -88,101 +100,113 @@ jobs:
             printf '%s\n' "$KICK_COOKIES" >> "$RUNNER_TEMP/cookies.txt"
           fi
 
-      - name: Download only the first N minutes at ≤720p (stream copy)
+      - name: 4. Download first N minutes at 720p
         run: |
           set -euo pipefail
-          MINUTES=${MINUTES//[^0-9]/}; MINUTES=${MINUTES:-90}
-          HEIGHT=${HEIGHT//[^0-9]/};   HEIGHT=${HEIGHT:-720}
-          END=$(printf '%02d:%02d:%02d' $((MINUTES/60)) $((MINUTES%60)) 0)
-          echo "Grabbing 00:00:00 → $END at ≤${HEIGHT}p"
-
-          # heartbeat so the log doesn't look frozen during a long pull
+          export PATH="/usr/local/bin:$PATH"
+          echo "Grabbing 00:00:00 -> $END"
           ( while true; do sleep 60; ls -lh source.* 2>/dev/null || true; done ) &
           HB=$!
           trap 'kill "$HB" 2>/dev/null || true' EXIT
 
-          yt-dlp \
-            --cookies "$RUNNER_TEMP/cookies.txt" \
-            --no-playlist --no-progress \
-            -S "res:${HEIGHT}" \
-            --download-sections "*00:00:00-${END}" \
-            --remux-video mkv --merge-output-format mkv \
-            --no-part --no-mtime \
-            --retries 20 --fragment-retries 30 \
-            --print-to-file "%(title)s" title.txt \
-            -o "source.%(ext)s" \
-            "$URL"
+          ok=0
+          if yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" \
+               --no-playlist --no-progress \
+               -S "res:720" \
+               --download-sections "*00:00:00-${END}" \
+               --remux-video mkv --merge-output-format mkv \
+               --no-part --no-mtime --retries 20 --fragment-retries 30 \
+               --print-to-file "%(title)s" title.txt \
+               -o "source.%(ext)s" "$URL"; then
+            ok=1
+          fi
+
+          if [ "$ok" -ne 1 ] || ! ls source.* > /dev/null 2>&1; then
+            echo "=== plan A failed, trying plan B (direct stream + ffmpeg) ==="
+            rm -f source.* || true
+            yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist \
+              -S "res:720" -g "$URL" > urls.txt
+            DIRECT=$(head -n1 urls.txt)
+            yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --skip-download \
+              --print-to-file "%(title)s" title.txt "$URL" || true
+            ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 \
+              -user_agent "Mozilla/5.0" -headers $'Referer: https://kick.com/\r\n' \
+              -i "$DIRECT" -t "$CUT_SECONDS" \
+              -map 0:v:0 -map 0:a:0? -c copy -y source.mkv
+          fi
 
           kill "$HB" 2>/dev/null || true
-
-          # guarantee source.mkv exists even if remux was skipped/odd ext
           if [ ! -f source.mkv ]; then
             shopt -s nullglob
             for f in source.*; do
               ffmpeg -hide_banner -loglevel error -y -i "$f" -c copy source.mkv
-              rm -f "$f"
-              break
+              rm -f "$f"; break
             done
           fi
-          [ -s source.mkv ] || { echo "download produced nothing"; ls -la; exit 1; }
+          if [ ! -s source.mkv ]; then
+            echo "FAILED: nothing downloaded. Make sure the link is a VOD from the channel's Videos tab."
+            exit 1
+          fi
           ls -lh source.mkv
-          ffprobe -v error -show_entries format=duration -of csv=p=0 source.mkv
 
-      - name: Encode → AV1 720p + Opus
+      - name: 5. Convert to AV1 720p
         id: enc
         run: |
           set -euo pipefail
-          VF="scale=w=-2:h='min(${HEIGHT},ih)'"
-          if [ "${FPS}" != "0" ]; then VF="${VF},fps=${FPS}"; fi
+          export PATH="/usr/local/bin:$PATH"
+          VF="scale=w=-2:h='min(720,ih)'"
+          if [ "$FPS" != "0" ]; then VF="${VF},fps=${FPS}"; fi
           mkdir -p dist
           RAW=$(cat title.txt 2>/dev/null || echo kick)
-          SAFE=$(printf '%s' "$RAW" | tr -d '\r\n' | sed 's/[^A-Za-z0-9._-]\+/_/g' | cut -c1-60)
+          SAFE=$(printf '%s' "$RAW" | tr -d '\r\n' | sed 's/[^A-Za-z0-9._-]\+/_/g' | cut -c1-50)
           SAFE=${SAFE:-kick}
-          OUT="dist/kick_${SAFE}_${HEIGHT}p_first${MINUTES}min_av1-crf${CRF}-p${PRESET}.mkv"
-          echo "Encoding → $OUT"
+          OUT="dist/kick_${SAFE}_720p_first${MINUTES}min_av1.mkv"
+          echo "Encoding to $OUT"
           ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -y \
             -i source.mkv \
             -map 0:v:0 -map 0:a:0? -map_metadata -1 -map_chapters -1 \
             -vf "$VF" -pix_fmt yuv420p10le \
             -c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 240 \
             -svtav1-params "tune=0:lp=$(nproc):enable-overlays=1" \
-            -c:a libopus -b:a "${AB}k" \
+            -c:a libopus -b:a 64k \
             "$OUT"
-          [ -s "$OUT" ] || { echo "encode produced nothing"; exit 1; }
+          [ -s "$OUT" ] || { echo "FAILED: encode produced nothing"; exit 1; }
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
-      - name: Size report
+      - name: 6. Size report
         env:
           OUT_PATH: ${{ steps.enc.outputs.out }}
         run: |
           set -euo pipefail
+          export PATH="/usr/local/bin:$PATH"
           SRC=$(stat -c%s source.mkv)
           OUT=$(stat -c%s "$OUT_PATH")
           DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT_PATH")
           MINS=$(awk -v d="$DUR" 'BEGIN{printf "%.1f", d/60}')
-          PCT=$(awk -v s="$SRC" -v o="$OUT" 'BEGIN{ if (s>0) printf "%d", 100-(o*100/s); else print 0 }')
+          PCT=$(awk -v s="$SRC" -v o="$OUT" 'BEGIN{if(s>0)printf "%d",100-(o*100/s); else print 0}')
           {
-            echo "### Kick → AV1"
+            echo "## Done"
             echo "| | |"
             echo "|---|---|"
-            echo "| Duration | ${MINS} min |"
-            echo "| Source (≤${HEIGHT}p) | $((SRC/1048576)) MiB |"
-            echo "| AV1 CRF ${CRF} / preset ${PRESET} | $((OUT/1048576)) MiB |"
-            echo "| **Saved** | **${PCT}%** |"
+            echo "| Length | ${MINS} min |"
+            echo "| Original 720p | $((SRC/1048576)) MB |"
+            echo "| AV1 version | $((OUT/1048576)) MB |"
+            echo "| Space saved | ${PCT}% |"
+            echo ""
+            echo "Download it from the **Artifacts** box at the bottom of this run page."
           } >> "$GITHUB_STEP_SUMMARY"
           ls -lh dist/
 
-      - name: Upload artifact
+      - name: 7. Upload file
         uses: actions/upload-artifact@v4
         with:
-          name: kick-av1-${{ inputs.height }}p-run${{ github.run_number }}
+          name: kick-av1-720p-run${{ github.run_number }}
           path: dist/*.mkv
           retention-days: 7
-          compression-level: 0      # already compressed, don't waste time zipping
+          compression-level: 0
           if-no-files-found: error
 
-      # PATCHED: gh needs GH_REPO because there's no git checkout in this job
-      - name: Attach to Release (optional, longer-lived)
+      - name: 8. Put in Release (optional)
         if: ${{ inputs.publish_release }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -190,10 +214,9 @@ jobs:
         run: |
           set -euo pipefail
           TAG="vod-$(date -u +%Y%m%d-%H%M%S)"
-          gh release create "$TAG" dist/*.mkv \
-            --title "$TAG" \
-            --notes "First ${MINUTES} min · ${HEIGHT}p · AV1 CRF ${CRF} preset ${PRESET} · ${URL}"
+          gh release create "$TAG" dist/*.mkv --title "$TAG" \
+            --notes "First ${MINUTES} min, 720p AV1. Source: ${URL}"
 
-      - name: Scrub cookies
+      - name: 9. Cleanup
         if: always()
         run: rm -f "$RUNNER_TEMP/cookies.txt"
