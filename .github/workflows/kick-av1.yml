@@ -1,21 +1,21 @@
-name: Kick VOD to AV1 (tweakable)
+name: Video to AV1 (any site)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Kick VOD link (kick.com/CHANNEL/videos/ID)"
+        description: "Video URL — Kick, YouTube, Twitch VOD, X, Reddit, Vimeo... (any yt-dlp site)"
         required: true
         type: string
       minutes:
-        description: "Minutes to keep from the start (5 = quick test)"
+        description: "Minutes to keep from the start (5 = quick test, 0 = whole video)"
         default: "90"
         type: string
       source_height:
         description: "Source quality to download (1080 -> 720 downscale looks best)"
         type: choice
         default: "720"
-        options: ["720", "1080", "480", "360", "best"]
+        options: ["720", "1080", "1440", "480", "360", "best"]
       out_height:
         description: "Output height (same = keep source, never upscales)"
         type: choice
@@ -42,13 +42,14 @@ on:
         description: "Advanced ffmpeg flags, e.g. -g 300 -ac 1 -pix_fmt yuv420p"
         default: ""
         type: string
-      publish_release:
-        description: "Also put the file in a GitHub Release (permanent link)"
-        type: boolean
-        default: false
+      destination:
+        description: "Where the file goes (artifact is ALWAYS uploaded as a backup)"
+        type: choice
+        default: "drive"
+        options: ["artifact", "drive", "release", "all"]
 
 concurrency:
-  group: kick-av1
+  group: video-av1
   cancel-in-progress: false
 
 defaults:
@@ -71,13 +72,14 @@ jobs:
       PRESET_IN: ${{ inputs.preset }}
       AUDIO_KBPS: ${{ inputs.audio_kbps }}
       EXTRA: ${{ inputs.extra }}
+      DEST: ${{ inputs.destination }}
+      GDRIVE_FOLDER: ${{ vars.GDRIVE_FOLDER || 'KickAV1' }}
 
     steps:
       - name: 1. Settings
         run: |
           set -euo pipefail
           M=${MINUTES//[^0-9]/}; M=${M:-90}
-          if [ "$M" -lt 1 ]; then M=90; fi
           C=${CRF_IN//[^0-9]/}; C=${C:-32}
           if [ "$C" -gt 63 ]; then C=63; fi
           P=${PRESET_IN//[^0-9]/}; P=${P:-6}
@@ -104,10 +106,8 @@ jobs:
             AUDIO_ARGS="-c:a libopus -b:a ${AB}k"; ATAG="opus${AB}"
           fi
 
-          HTAG="$OUT_HEIGHT"
-          if [ "$HTAG" = "same" ]; then HTAG="src"; fi
-          FTAG="src"
-          if [ -n "$F" ] && [ "$F" != "0" ]; then FTAG="$F"; fi
+          HTAG="$OUT_HEIGHT"; if [ "$HTAG" = "same" ]; then HTAG="src"; fi
+          FTAG="src"; if [ -n "$F" ] && [ "$F" != "0" ]; then FTAG="$F"; fi
 
           {
             echo "MINUTES=$M"
@@ -120,64 +120,82 @@ jobs:
             echo "AUDIO_ARGS=$AUDIO_ARGS"
             echo "TAG=${HTAG}p${FTAG}_${ATAG}"
           } >> "$GITHUB_ENV"
-          echo "keep ${M}min | source ${SORT} | vf ${VF} | crf ${C} | preset ${P} | audio ${AUDIO_ARGS}"
-          echo "extra: ${EXTRA:-none}"
+          echo "keep ${M}min (0=full) | source ${SORT} | vf ${VF} | crf ${C} | preset ${P} | ${AUDIO_ARGS}"
+          echo "destination: ${DEST} | drive folder: ${GDRIVE_FOLDER}"
 
-      - name: 2. Install ffmpeg (AV1) + yt-dlp, then self-test
+      - name: 2. Install ffmpeg (AV1) + yt-dlp + rclone, then self-test
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
           cd /tmp
           mkdir -p ff
-          echo "--- downloading ffmpeg ---"
+          echo "--- ffmpeg ---"
           curl -fsSL --retry 5 --retry-delay 5 -o ff.tar.xz \
             https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ff.tar.xz -C ff --strip-components=1
           sudo install -m755 ff/bin/ffmpeg  /usr/local/bin/ffmpeg
           sudo install -m755 ff/bin/ffprobe /usr/local/bin/ffprobe
           rm -rf ff ff.tar.xz
-          echo "--- downloading yt-dlp ---"
+          echo "--- yt-dlp ---"
           curl -fsSL --retry 5 --retry-delay 5 -o yt-dlp \
             https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp
           sudo install -m755 yt-dlp /usr/local/bin/yt-dlp
           rm -f yt-dlp
+          echo "--- rclone ---"
+          curl -fsSL --retry 5 -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
+          unzip -q -o rclone.zip -d rc
+          sudo install -m755 rc/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+          rm -rf rc rclone.zip
           hash -r
-          echo "ffmpeg = $(command -v ffmpeg)"
           ffmpeg -hide_banner -version > v.txt; head -n1 v.txt
           yt-dlp --version
+          rclone version | head -n1
           echo "--- AV1 self-test (1 second) ---"
           ffmpeg -hide_banner -loglevel error \
             -f lavfi -i "testsrc=size=320x240:rate=30" -t 1 \
             -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 40 -f null -
           echo "AV1 ENCODER WORKS"
 
-      - name: 3. Cookies (only if you added a KICK_COOKIES secret)
+      - name: 3. Cookies (optional secret COOKIES_TXT, or old KICK_COOKIES)
         env:
+          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
           KICK_COOKIES: ${{ secrets.KICK_COOKIES }}
         run: |
           set -euo pipefail
           printf '# Netscape HTTP Cookie File\n' > "$RUNNER_TEMP/cookies.txt"
-          if [ -n "${KICK_COOKIES:-}" ]; then
+          if [ -n "${COOKIES_TXT:-}" ]; then
+            printf '%s\n' "$COOKIES_TXT" >> "$RUNNER_TEMP/cookies.txt"
+            echo "using COOKIES_TXT secret"
+          elif [ -n "${KICK_COOKIES:-}" ]; then
             printf '%s\n' "$KICK_COOKIES" >> "$RUNNER_TEMP/cookies.txt"
+            echo "using KICK_COOKIES secret"
+          else
+            echo "no cookies (fine for public videos)"
           fi
 
-      - name: 4. Download first N minutes
+      - name: 4. Download
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
-          echo "Grabbing 00:00:00 -> $END | source preference: $SORT"
+          if [ "$MINUTES" = "0" ]; then
+            RANGE=""; echo "Downloading the FULL video"
+          else
+            RANGE="*00:00:00-${END}"; echo "Downloading 00:00:00 -> $END"
+          fi
           ( while true; do sleep 60; ls -lh source.* 2>/dev/null || true; done ) &
           HB=$!
           trap 'kill "$HB" 2>/dev/null || true' EXIT
 
           ok=0
           if yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" \
-               --no-playlist --no-progress \
+               --no-playlist --no-progress -N 8 \
                -S "$SORT" \
-               --download-sections "*00:00:00-${END}" \
+               ${RANGE:+--download-sections "$RANGE"} \
                --remux-video mkv --merge-output-format mkv \
                --no-part --no-mtime --retries 20 --fragment-retries 30 \
+               --extractor-retries 5 \
                --print-to-file "%(title)s" title.txt \
+               --print-to-file "%(extractor_key)s" site.txt \
                -o "source.%(ext)s" "$URL"; then
             ok=1
           fi
@@ -189,10 +207,15 @@ jobs:
               -S "$SORT" -g "$URL" > urls.txt
             DIRECT=$(head -n1 urls.txt)
             yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --skip-download \
-              --print-to-file "%(title)s" title.txt "$URL" || true
+              --print-to-file "%(title)s" title.txt \
+              --print-to-file "%(extractor_key)s" site.txt "$URL" || true
+            ORIGIN=$(printf '%s' "$URL" | sed -E 's#^(https?://[^/]+).*#\1#')
+            TARGS=()
+            if [ "$MINUTES" != "0" ]; then TARGS=(-t "$CUT_SECONDS"); fi
             ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 \
-              -user_agent "Mozilla/5.0" -headers $'Referer: https://kick.com/\r\n' \
-              -i "$DIRECT" -t "$CUT_SECONDS" \
+              -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+              -headers "Referer: ${ORIGIN}/"$'\r\n' \
+              -i "$DIRECT" "${TARGS[@]}" \
               -map 0:v:0 -map 0:a:0? -c copy -y source.mkv
           fi
 
@@ -205,7 +228,9 @@ jobs:
             done
           fi
           if [ ! -s source.mkv ]; then
-            echo "FAILED: nothing downloaded. Use a VOD link from the channel's Videos tab."
+            echo "FAILED: nothing downloaded."
+            echo "- Is the URL a video page (not a channel/profile)?"
+            echo "- Login/age-restricted? Add a COOKIES_TXT secret."
             exit 1
           fi
           ls -lh source.mkv
@@ -218,10 +243,12 @@ jobs:
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
           mkdir -p dist
-          RAW=$(cat title.txt 2>/dev/null || echo kick)
+          RAW=$(cat title.txt 2>/dev/null || echo video)
+          SITE=$(cat site.txt 2>/dev/null || echo vid)
           SAFE=$(printf '%s' "$RAW" | tr -d '\r\n' | sed 's/[^A-Za-z0-9._-]\+/_/g' | cut -c1-50)
-          SAFE=${SAFE:-kick}
-          OUT="dist/kick_${SAFE}_${TAG}_${MINUTES}min_crf${CRF}-p${PRESET}.mkv"
+          SITE=$(printf '%s' "$SITE" | tr -cd 'A-Za-z0-9' | cut -c1-12)
+          SAFE=${SAFE:-video}; SITE=${SITE:-vid}
+          OUT="dist/${SITE}_${SAFE}_${TAG}_first${MINUTES}min_crf${CRF}-p${PRESET}.mkv"
           echo "Output: $OUT"
           ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -y \
             -i source.mkv \
@@ -255,32 +282,62 @@ jobs:
             echo "| Output | ${TAG} · CRF ${CRF} · preset ${PRESET} · $((OUT/1048576)) MB |"
             echo "| Total bitrate | ${BR} kbps |"
             echo "| Space saved | ${PCT}% |"
-            echo "| Extra flags | \`${EXTRA:-none}\` |"
+            echo "| Destination | ${DEST} |"
             echo ""
-            echo "Grab the file from **Artifacts** at the bottom of this page."
+            echo "Backup copy is in **Artifacts** at the bottom of this page."
           } >> "$GITHUB_STEP_SUMMARY"
           ls -lh dist/
 
-      - name: 7. Upload file
+      - name: 7. Upload artifact (always, safety net)
         uses: actions/upload-artifact@v4
         with:
-          name: kick-av1-${{ inputs.out_height }}p-run${{ github.run_number }}
+          name: av1-${{ inputs.out_height }}p-run${{ github.run_number }}
           path: dist/*.mkv
           retention-days: 7
           compression-level: 0
           if-no-files-found: error
 
-      - name: 8. Put in Release (optional)
-        if: ${{ inputs.publish_release }}
+      - name: 8. Upload to Google Drive
+        if: ${{ inputs.destination == 'drive' || inputs.destination == 'all' }}
+        env:
+          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/bin:$PATH"
+          if [ -z "${RCLONE_CONFIG_TEXT:-}" ]; then
+            echo "ERROR: no RCLONE_CONFIG secret. Add it (see setup) or pick destination=artifact."
+            exit 1
+          fi
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s\n' "$RCLONE_CONFIG_TEXT" > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          echo "remotes found:"; rclone listremotes
+          if ! rclone listremotes | grep -q '^gdrive:$'; then
+            echo "ERROR: your secret must contain a remote named [gdrive]"
+            exit 1
+          fi
+          echo "Uploading to Drive folder: ${GDRIVE_FOLDER}"
+          rclone copy dist/ "gdrive:${GDRIVE_FOLDER}" \
+            --drive-chunk-size 64M --transfers 1 --checkers 4 \
+            --retries 5 --low-level-retries 10 \
+            --stats 1m --stats-one-line -v
+          echo "--- folder contents ---"
+          rclone lsl "gdrive:${GDRIVE_FOLDER}" > listing.txt
+          tail -n 5 listing.txt
+          echo "Uploaded to Google Drive / ${GDRIVE_FOLDER}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 9. Put in Release
+        if: ${{ inputs.destination == 'release' || inputs.destination == 'all' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          T="vod-$(date -u +%Y%m%d-%H%M%S)"
+          T="vid-$(date -u +%Y%m%d-%H%M%S)"
           gh release create "$T" dist/*.mkv --title "$T" \
-            --notes "First ${MINUTES} min · ${TAG} · CRF ${CRF} preset ${PRESET} · ${URL}"
+            --notes "${TAG} · CRF ${CRF} preset ${PRESET} · ${URL}"
 
-      - name: 9. Cleanup
+      - name: 10. Cleanup secrets
         if: always()
-        run: rm -f "$RUNNER_TEMP/cookies.txt"
+        run: |
+          rm -f "$RUNNER_TEMP/cookies.txt" "$HOME/.config/rclone/rclone.conf"
