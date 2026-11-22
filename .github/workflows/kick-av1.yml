@@ -1,68 +1,24 @@
 name: Video to AV1 (multi-link + torrents)
-
 on:
   workflow_dispatch:
     inputs:
-      urls:
-        description: "Links separated by spaces or commas (magnets OK). Empty = use links.txt in repo"
-        required: false
-        default: ""
-        type: string
-      minutes:
-        description: "Minutes to keep from the start (0 = whole video)"
-        default: "90"
-        type: string
-      source_height:
-        description: "Source quality to download"
-        type: choice
-        default: "720"
-        options: ["720", "1080", "1440", "480", "360", "best"]
-      out_height:
-        description: "Output height (same = keep source, never upscales)"
-        type: choice
-        default: "720"
-        options: ["720", "1080", "480", "360", "same"]
-      fps:
-        description: "Output fps (0 = keep source)"
-        default: "30"
-        type: string
-      crf:
-        description: "AV1 CRF 0-63 (lower = better/bigger)"
-        default: "32"
-        type: string
-      preset:
-        description: "SVT-AV1 preset (lower = slower/smaller)"
-        type: choice
-        default: "6"
-        options: ["4", "5", "6", "7", "8", "9", "10"]
-      audio_kbps:
-        description: "Opus kbps (0 = copy original audio)"
-        default: "64"
-        type: string
-      extra:
-        description: "Advanced ffmpeg flags, e.g. -g 300 -ac 1"
-        default: ""
-        type: string
-      destination:
-        description: "Artifact is ALWAYS uploaded as backup; drive/release are extra"
-        type: choice
-        default: "drive"
-        options: ["artifact", "drive", "release", "all"]
-
-concurrency:
-  group: video-av1
-  cancel-in-progress: false
-
-defaults:
-  run:
-    shell: bash
-
+      urls: {description: "Links separated by spaces/commas. Empty = links.txt in repo", required: false, default: "", type: string}
+      minutes: {description: "Minutes from start (0 = whole video)", default: "90", type: string}
+      source_height: {description: "Source quality to download", type: choice, default: "720", options: ["720","1080","1440","480","360","best"]}
+      out_height: {description: "Output height (same = no scaling)", type: choice, default: "720", options: ["720","1080","480","360","same"]}
+      fps: {description: "Output fps (0 = keep source)", default: "30", type: string}
+      crf: {description: "AV1 CRF 0-63 (lower = better/bigger)", default: "32", type: string}
+      preset: {description: "SVT preset (lower = slower/smaller)", type: choice, default: "6", options: ["4","5","6","7","8","9","10"]}
+      audio_kbps: {description: "Opus kbps (0 = copy original audio)", default: "64", type: string}
+      extra: {description: "Extra ffmpeg flags e.g. -g 300 -ac 1", default: "", type: string}
+      destination: {description: "Artifact always uploaded; drive/release are extra", type: choice, default: "drive", options: ["artifact","drive","release","all"]}
+concurrency: {group: video-av1, cancel-in-progress: false}
+defaults: {run: {shell: bash}}
 jobs:
   rip:
     runs-on: ubuntu-latest
     timeout-minutes: 350
-    permissions:
-      contents: write
+    permissions: {contents: write}
     env:
       URLS_IN: ${{ inputs.urls }}
       MINUTES: ${{ inputs.minutes }}
@@ -79,95 +35,69 @@ jobs:
       TORRENT_TIMEOUT_MIN: "120"
       MAX_FILES_PER_TORRENT: "3"
       MIN_VIDEO_MB: "50"
-
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
+        with: {fetch-depth: 1}
       - name: 1. Settings
         run: |
           set -euo pipefail
           M=${MINUTES//[^0-9]/}; M=${M:-90}
           C=${CRF_IN//[^0-9]/}; C=${C:-32}; if [ "$C" -gt 63 ]; then C=63; fi
           P=${PRESET_IN//[^0-9]/}; P=${P:-6}; if [ "$P" -gt 10 ]; then P=10; fi
-          F=${FPS//[^0-9.]/}
-          AB=${AUDIO_KBPS//[^0-9]/}
+          F=${FPS//[^0-9.]/}; AB=${AUDIO_KBPS//[^0-9]/}
           if [ "$SOURCE_HEIGHT" = "best" ]; then SORT="res"; else SORT="res:${SOURCE_HEIGHT}"; fi
-          SCALE=""
-          if [ "$OUT_HEIGHT" != "same" ]; then SCALE="scale=w=-2:h='min(${OUT_HEIGHT},ih)'"; fi
-          VF=""
-          if [ -n "$SCALE" ]; then VF="$SCALE"; fi
+          SCALE=""; VF=""
+          if [ "$OUT_HEIGHT" != "same" ]; then SCALE="scale=w=-2:h='min(${OUT_HEIGHT},ih)'"; VF="$SCALE"; fi
           if [ -n "$F" ] && [ "$F" != "0" ]; then
             if [ -n "$VF" ]; then VF="${VF},fps=${F}"; else VF="fps=${F}"; fi
           fi
           if [ -z "$VF" ]; then VF="null"; fi
           if [ -z "$AB" ] || [ "$AB" = "0" ]; then AUDIO_ARGS="-c:a copy"; else AUDIO_ARGS="-c:a libopus -b:a ${AB}k"; fi
-          {
-            echo "MINUTES=$M"
-            echo "CUT_SECONDS=$((M*60))"
+          { echo "MINUTES=$M"; echo "CUT_SECONDS=$((M*60))"
             printf 'END=%02d:%02d:%02d\n' $((M/60)) $((M%60)) 0
-            echo "SORT=$SORT"
-            echo "VF=$VF"
-            echo "CRF=$C"
-            echo "PRESET=$P"
-            echo "AUDIO_ARGS=$AUDIO_ARGS"
-            echo "DEADLINE=$(( $(date +%s) + DEADLINE_MIN*60 ))"
-          } >> "$GITHUB_ENV"
+            echo "SORT=$SORT"; echo "VF=$VF"; echo "CRF=$C"; echo "PRESET=$P"; echo "AUDIO_ARGS=$AUDIO_ARGS"
+            echo "DEADLINE=$(( $(date +%s) + DEADLINE_MIN*60 ))"; } >> "$GITHUB_ENV"
           echo "keep ${M}min | ${SORT} | vf ${VF} | crf ${C} | preset ${P} | ${AUDIO_ARGS}"
-
       - name: 2. Build link list
         run: |
           set -euo pipefail
           mkdir -p work dist
-          printf '%s' "$URLS_IN" | tr ',;' '\n\n' | tr ' ' '\n' \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' > work/urls.txt || true
+          printf '%s' "$URLS_IN" | tr ',;' '\n\n' | tr ' ' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' > work/urls.txt || true
           if [ ! -s work/urls.txt ] && [ -f links.txt ]; then
-            echo "reading links.txt from repo"
-            sed 's/#.*$//' links.txt | tr ',;' '\n\n' | tr ' ' '\n' \
-              | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' > work/urls.txt || true
+            sed 's/#.*$//' links.txt | tr ',;' '\n\n' | tr ' ' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' > work/urls.txt || true
           fi
           if [ ! -s work/urls.txt ]; then echo "ERROR: no links given"; exit 1; fi
           echo "--- queue ---"; cat -n work/urls.txt
-
       - name: 3. Install tools + AV1 self-test
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
           cd /tmp; mkdir -p ff
-          curl -fsSL --retry 5 --retry-delay 5 -o ff.tar.xz \
-            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          curl -fsSL --retry 5 --retry-delay 5 -o ff.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ff.tar.xz -C ff --strip-components=1
           sudo install -m755 ff/bin/ffmpeg /usr/local/bin/ffmpeg
           sudo install -m755 ff/bin/ffprobe /usr/local/bin/ffprobe
           rm -rf ff ff.tar.xz
-          curl -fsSL --retry 5 -o yt-dlp \
-            https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp
+          curl -fsSL --retry 5 -o yt-dlp https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp
           sudo install -m755 yt-dlp /usr/local/bin/yt-dlp; rm -f yt-dlp
           curl -fsSL --retry 5 -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip -q -o rclone.zip -d rc
           sudo install -m755 rc/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
           rm -rf rc rclone.zip
           if grep -qiE '^magnet:|\.torrent' "$GITHUB_WORKSPACE/work/urls.txt"; then
-            echo "--- torrent links found: installing qbittorrent-nox ---"
-            if curl -fsSL --retry 3 -o qbt \
-                https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox \
-               && chmod +x qbt && ./qbt --version > /dev/null 2>&1; then
+            if curl -fsSL --retry 3 -o qbt https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox && chmod +x qbt && ./qbt --version > /dev/null 2>&1; then
               sudo install -m755 qbt /usr/local/bin/qbittorrent-nox
             else
               sudo apt-get update -qq && sudo apt-get install -y -qq qbittorrent-nox
             fi
-            rm -f qbt
-            qbittorrent-nox --version | head -n1
+            rm -f qbt; qbittorrent-nox --version | head -n1
           fi
           hash -r
           ffmpeg -hide_banner -version > v.txt; head -n1 v.txt
           yt-dlp --version; rclone version | head -n1; jq --version
-          ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc=size=320x240:rate=30" -t 1 \
-            -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 40 -f null -
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc=size=320x240:rate=30" -t 1 -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 40 -f null -
           echo "AV1 ENCODER WORKS"
-
-      - name: 4. Cookies (optional secret COOKIES_TXT)
+      - name: 4. Cookies
         env:
           COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
           KICK_COOKIES: ${{ secrets.KICK_COOKIES }}
@@ -176,17 +106,15 @@ jobs:
           printf '# Netscape HTTP Cookie File\n' > "$RUNNER_TEMP/cookies.txt"
           if [ -n "${COOKIES_TXT:-}" ]; then printf '%s\n' "$COOKIES_TXT" >> "$RUNNER_TEMP/cookies.txt"
           elif [ -n "${KICK_COOKIES:-}" ]; then printf '%s\n' "$KICK_COOKIES" >> "$RUNNER_TEMP/cookies.txt"; fi
-
-      - name: 5. Start torrent engine (DHT/PEX/LSD/uTP + tracker boost)
+      - name: 5. Start torrent engine
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
-          if ! command -v qbittorrent-nox > /dev/null 2>&1; then echo "no torrents in queue, skipping"; exit 0; fi
+          if ! command -v qbittorrent-nox > /dev/null 2>&1; then echo "no torrents, skipping"; exit 0; fi
           mkdir -p "$HOME/.config/qBittorrent" "$GITHUB_WORKSPACE/dl"
           cat > "$HOME/.config/qBittorrent/qBittorrent.conf" <<EOF
           [LegalNotice]
           Accepted=true
-
           [Preferences]
           WebUI\\Enabled=true
           WebUI\\Address=127.0.0.1
@@ -197,14 +125,7 @@ jobs:
           Downloads\\SavePath=$GITHUB_WORKSPACE/dl
           Session\\DefaultSavePath=$GITHUB_WORKSPACE/dl
           EOF
-          curl -fsSL --retry 3 -o work/trackers_raw.txt \
-            https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt || \
-            printf '%s\n' \
-              "udp://tracker.opentrackr.org:1337/announce" \
-              "udp://open.demonii.com:1337/announce" \
-              "udp://open.stealth.si:80/announce" \
-              "udp://exodus.desync.com:6969/announce" \
-              "udp://tracker.torrent.eu.org:451/announce" > work/trackers_raw.txt
+          curl -fsSL --retry 3 -o work/trackers_raw.txt https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt || printf '%s\n' "udp://tracker.opentrackr.org:1337/announce" "udp://open.demonii.com:1337/announce" "udp://open.stealth.si:80/announce" "udp://exodus.desync.com:6969/announce" "udp://tracker.torrent.eu.org:451/announce" > work/trackers_raw.txt
           grep -v '^[[:space:]]*$' work/trackers_raw.txt | sort -u > work/tr.txt
           echo "trackers loaded: $(wc -l < work/tr.txt)"
           nohup qbittorrent-nox --webui-port=8080 > work/qbt.log 2>&1 &
@@ -212,38 +133,23 @@ jobs:
             if curl -sf http://127.0.0.1:8080/api/v2/app/version > /dev/null; then break; fi
             sleep 2
           done
-          if ! curl -sf http://127.0.0.1:8080/api/v2/app/version > /dev/null; then
-            echo "qBittorrent API did not come up"; tail -n 40 work/qbt.log; exit 1
-          fi
-          jq -n --arg tr "$(cat work/tr.txt)" '{
-            dht:true, pex:true, lsd:true,
-            max_connec:1000, max_connec_per_torrent:300,
-            max_uploads:-1, max_uploads_per_torrent:-1,
-            anonymous_mode:false, encryption:0, bittorrent_protocol:0,
-            limit_utp_rate:false, upnp:false, random_port:false, listen_port:6881,
-            add_trackers:true, add_trackers_enabled:true, additional_trackers:$tr,
-            slow_torrent_dl_rate_threshold:0
-          }' > work/prefs.json
-          curl -s -X POST http://127.0.0.1:8080/api/v2/app/setPreferences \
-            --data-urlencode "json@work/prefs.json" > /dev/null
-          echo "torrent engine ready: $(curl -s http://127.0.0.1:8080/api/v2/app/version)"
-             - name: 6. Process every link
+          if ! curl -sf http://127.0.0.1:8080/api/v2/app/version > /dev/null; then echo "API down"; tail -n 40 work/qbt.log; exit 1; fi
+          jq -n --arg tr "$(cat work/tr.txt)" '{dht:true,pex:true,lsd:true,max_connec:1000,max_connec_per_torrent:300,max_uploads:-1,max_uploads_per_torrent:-1,anonymous_mode:false,encryption:0,bittorrent_protocol:0,limit_utp_rate:false,upnp:false,random_port:false,listen_port:6881,add_trackers:true,add_trackers_enabled:true,additional_trackers:$tr,slow_torrent_dl_rate_threshold:0}' > work/prefs.json
+          curl -s -X POST http://127.0.0.1:8080/api/v2/app/setPreferences --data-urlencode "json@work/prefs.json" > /dev/null
+          echo "torrent engine ready"
+      - name: 6. Process every link
         run: |
           set -uo pipefail
           export PATH="/usr/local/bin:$PATH"
           API=http://127.0.0.1:8080/api/v2
-          mkdir -p dist work
-          : > work/failures.txt
-
+          mkdir -p dist work; : > work/failures.txt
           sanitize() {
             local s="$1"
             s=$(printf '%s' "$s" | tr -d '\000-\037' | sed 's#[/\\:*?"<>|]# #g')
             s=$(printf '%s' "$s" | sed 's/  */ /g; s/^ *//; s/ *$//; s/\.+$//')
-            s="${s:0:120}"
-            if [ -z "$s" ]; then s="video"; fi
+            s="${s:0:120}"; if [ -z "$s" ]; then s="video"; fi
             printf '%s' "$s"
           }
-
           encode_file() {
             local src="$1" name="$2" out n=2
             out="dist/${name}.mkv"
@@ -251,41 +157,24 @@ jobs:
             local targs=()
             if [ "$MINUTES" != "0" ]; then targs=(-t "$CUT_SECONDS"); fi
             echo ">>> encoding: $name"
-            ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -y \
-              -err_detect ignore_err -i "$src" \
-              -map 0:v:0 -map 0:a:0? -map_metadata -1 -map_chapters -1 \
-              -vf "$VF" -pix_fmt yuv420p10le \
-              -c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 240 \
-              -svtav1-params "tune=0:lp=$(nproc):enable-overlays=1" \
-              $AUDIO_ARGS "${targs[@]}" $EXTRA "$out"
+            ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -y -err_detect ignore_err -i "$src" -map 0:v:0 -map 0:a:0? -map_metadata -1 -map_chapters -1 -vf "$VF" -pix_fmt yuv420p10le -c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 240 -svtav1-params "tune=0:lp=$(nproc):enable-overlays=1" $AUDIO_ARGS "${targs[@]}" $EXTRA "$out"
             if [ -s "$out" ]; then echo "OK: $out"; return 0; fi
             rm -f "$out"; echo "ENCODE FAILED: $name"; return 1
           }
-
           handle_web() {
             local u="$1" d title
             rm -f work/src.* work/title.txt
             local rargs=()
             if [ "$MINUTES" != "0" ]; then rargs=(--download-sections "*00:00:00-${END}"); fi
-            if ! yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --no-progress -N 8 \
-                 -S "$SORT" "${rargs[@]}" \
-                 --remux-video mkv --merge-output-format mkv --no-part --no-mtime \
-                 --retries 20 --fragment-retries 30 --extractor-retries 5 \
-                 --print-to-file "%(title)s" work/title.txt \
-                 -o "work/src.%(ext)s" "$u"; then
-              echo "plan A failed -> plan B (direct stream)"
+            if ! yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --no-progress -N 8 -S "$SORT" "${rargs[@]}" --remux-video mkv --merge-output-format mkv --no-part --no-mtime --retries 20 --fragment-retries 30 --extractor-retries 5 --print-to-file "%(title)s" work/title.txt -o "work/src.%(ext)s" "$u"; then
+              echo "plan A failed -> plan B"
               rm -f work/src.*
               yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist -S "$SORT" -g "$u" > work/direct.txt || return 1
               d=$(head -n1 work/direct.txt)
-              yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --skip-download \
-                --print-to-file "%(title)s" work/title.txt "$u" || true
-              local ta=()
-              if [ "$MINUTES" != "0" ]; then ta=(-t "$CUT_SECONDS"); fi
+              yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --skip-download --print-to-file "%(title)s" work/title.txt "$u" || true
+              local ta=(); if [ "$MINUTES" != "0" ]; then ta=(-t "$CUT_SECONDS"); fi
               local org; org=$(printf '%s' "$u" | sed -E 's#^(https?://[^/]+).*#\1#')
-              ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 \
-                -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-                -headers "Referer: ${org}/"$'\r\n' \
-                -i "$d" "${ta[@]}" -map 0:v:0 -map 0:a:0? -c copy -y work/src.mkv || return 1
+              ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -headers "Referer: ${org}/"$'\r\n' -i "$d" "${ta[@]}" -map 0:v:0 -map 0:a:0? -c copy -y work/src.mkv || return 1
             fi
             if [ ! -f work/src.mkv ]; then
               shopt -s nullglob
@@ -299,26 +188,21 @@ jobs:
             if [ -z "$title" ]; then title="video_$(date +%s)"; fi
             encode_file work/src.mkv "$(sanitize "$title")"
           }
-
           handle_torrent() {
             local u="$1" h resp dl="$GITHUB_WORKSPACE/dl/$RANDOM$RANDOM"
             mkdir -p "$dl"
             if printf '%s' "$u" | grep -qi '^magnet:'; then
-              resp=$(curl -s -X POST "$API/torrents/add" -F "urls=$u" -F "savepath=$dl" \
-                     -F "autoTMM=false" -F "sequentialDownload=true" -F "firstLastPiecePrio=true" -F "paused=false")
+              resp=$(curl -s -X POST "$API/torrents/add" -F "urls=$u" -F "savepath=$dl" -F "autoTMM=false" -F "sequentialDownload=true" -F "firstLastPiecePrio=true" -F "paused=false")
             else
               curl -fsSL --retry 3 -o work/in.torrent "$u" || { echo "cannot fetch .torrent"; return 1; }
-              resp=$(curl -s -X POST "$API/torrents/add" -F "torrents=@work/in.torrent" -F "savepath=$dl" \
-                     -F "autoTMM=false" -F "sequentialDownload=true" -F "firstLastPiecePrio=true" -F "paused=false")
+              resp=$(curl -s -X POST "$API/torrents/add" -F "torrents=@work/in.torrent" -F "savepath=$dl" -F "autoTMM=false" -F "sequentialDownload=true" -F "firstLastPiecePrio=true" -F "paused=false")
             fi
-            echo "add: $resp"
-            sleep 5
+            echo "add: $resp"; sleep 5
             h=$(curl -s "$API/torrents/info?sort=added_on&reverse=true" | jq -r '.[0].hash // empty')
             if [ -z "$h" ]; then echo "torrent not added"; return 1; fi
-            curl -s -X POST "$API/torrents/addTrackers" \
-              --data-urlencode "hash=$h" --data-urlencode "urls@work/tr.txt" > /dev/null
+            curl -s -X POST "$API/torrents/addTrackers" --data-urlencode "hash=$h" --data-urlencode "urls@work/tr.txt" > /dev/null
             curl -s -X POST "$API/torrents/resume" --data-urlencode "hashes=$h" > /dev/null || true
-            curl -s -X POST "$API/torrents/start"  --data-urlencode "hashes=$h" > /dev/null || true
+            curl -s -X POST "$API/torrents/start" --data-urlencode "hashes=$h" > /dev/null || true
             local limit=$(( $(date +%s) + TORRENT_TIMEOUT_MIN*60 ))
             local finished=0 p=0 st sp sd
             while :; do
@@ -327,24 +211,17 @@ jobs:
               st=$(printf '%s' "$j" | jq -r '.[0].state // "?"')
               sp=$(printf '%s' "$j" | jq -r '.[0].dlspeed // 0')
               sd=$(printf '%s' "$j" | jq -r '.[0].num_seeds // 0')
-              printf 'torrent %s  %s%%  state=%s  seeds=%s  %s KB/s\n' \
-                "${h:0:8}" "$(awk -v x="$p" 'BEGIN{printf "%.1f", x*100}')" "$st" "$sd" "$((sp/1024))"
+              printf 'torrent %s  %s%%  state=%s  seeds=%s  %s KB/s\n' "${h:0:8}" "$(awk -v x="$p" 'BEGIN{printf "%.1f", x*100}')" "$st" "$sd" "$((sp/1024))"
               if awk -v x="$p" 'BEGIN{exit !(x>=0.999)}'; then finished=1; break; fi
               case "$st" in error|missingFiles) echo "torrent error state"; break;; esac
-              if [ "$(date +%s)" -ge "$limit" ] || [ "$(date +%s)" -ge "$DEADLINE" ]; then
-                echo "torrent time budget reached"; break
-              fi
+              if [ "$(date +%s)" -ge "$limit" ] || [ "$(date +%s)" -ge "$DEADLINE" ]; then echo "torrent time budget reached"; break; fi
               sleep 60
             done
             curl -s -X POST "$API/torrents/pause" --data-urlencode "hashes=$h" > /dev/null || true
-            curl -s -X POST "$API/torrents/stop"  --data-urlencode "hashes=$h" > /dev/null || true
-            find "$dl" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.ts' \
-              -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.m4v' -o -iname '*.wmv' -o -iname '*.flv' \) \
-              -size +${MIN_VIDEO_MB}M -printf '%s\t%p\n' | sort -rn > work/tfiles.txt
-            if [ ! -s work/tfiles.txt ]; then echo "no usable video files in torrent"; rm -rf "$dl"; return 1; fi
-            if [ "$finished" != "1" ]; then
-              echo "NOTE: incomplete torrent - encoding what arrived (start of file lands first)"
-            fi
+            curl -s -X POST "$API/torrents/stop" --data-urlencode "hashes=$h" > /dev/null || true
+            find "$dl" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.ts' -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.m4v' -o -iname '*.wmv' -o -iname '*.flv' \) -size +${MIN_VIDEO_MB}M -printf '%s\t%p\n' | sort -rn > work/tfiles.txt
+            if [ ! -s work/tfiles.txt ]; then echo "no usable video files"; rm -rf "$dl"; return 1; fi
+            if [ "$finished" != "1" ]; then echo "NOTE: incomplete torrent - encoding what arrived"; fi
             local count=0 sz path base
             while IFS=$'\t' read -r sz path; do
               case "$path" in *sample*|*Sample*|*SAMPLE*) continue;; esac
@@ -354,19 +231,15 @@ jobs:
               count=$((count+1))
               if [ "$(date +%s)" -ge "$DEADLINE" ]; then break; fi
             done < work/tfiles.txt
-            curl -s -X POST "$API/torrents/delete" \
-              --data-urlencode "hashes=$h" --data-urlencode "deleteFiles=true" > /dev/null || true
-            rm -rf "$dl"
-            return 0
+            curl -s -X POST "$API/torrents/delete" --data-urlencode "hashes=$h" --data-urlencode "deleteFiles=true" > /dev/null || true
+            rm -rf "$dl"; return 0
           }
-
           i=0
           while IFS= read -r u; do
             if [ -z "$u" ]; then continue; fi
             i=$((i+1))
-            if [ "$(date +%s)" -ge "$DEADLINE" ]; then echo "TIME BUDGET REACHED - stopping queue"; break; fi
-            echo ""
-            echo "==================== [$i] $u"
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then echo "TIME BUDGET REACHED"; break; fi
+            echo ""; echo "==================== [$i] $u"
             if printf '%s' "$u" | grep -qiE '^magnet:|\.torrent'; then
               handle_torrent "$u" || printf '%s\n' "$u" >> work/failures.txt
             else
@@ -375,32 +248,22 @@ jobs:
             rm -f work/src.* || true
             df -h . | tail -n1
           done < work/urls.txt
-
           echo ""; echo "=== OUTPUT ==="; ls -lh dist/ || true
           if ! ls dist/*.mkv > /dev/null 2>&1; then echo "NOTHING PRODUCED"; exit 1; fi
-
       - name: 7. Report
         run: |
           set -uo pipefail
           export PATH="/usr/local/bin:$PATH"
-          {
-            echo "## Results"
-            echo "| File | Length | Size |"
-            echo "|---|---|---|"
-          } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## Results"; echo "| File | Length | Size |"; echo "|---|---|---|"; } >> "$GITHUB_STEP_SUMMARY"
           for f in dist/*.mkv; do
             [ -e "$f" ] || continue
             D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo 0)
             S=$(stat -c%s "$f")
-            printf '| %s | %s min | %s MB |\n' "$(basename "$f")" \
-              "$(awk -v d="$D" 'BEGIN{printf "%.1f", d/60}')" "$((S/1048576))" >> "$GITHUB_STEP_SUMMARY"
+            printf '| %s | %s min | %s MB |\n' "$(basename "$f")" "$(awk -v d="$D" 'BEGIN{printf "%.1f", d/60}')" "$((S/1048576))" >> "$GITHUB_STEP_SUMMARY"
           done
-          if [ -s work/failures.txt ]; then
-            { echo ""; echo "### Failed links"; echo '```'; cat work/failures.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo "Settings: ${OUT_HEIGHT}p · fps ${FPS} · CRF ${CRF} · preset ${PRESET} · ${AUDIO_ARGS}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 8. Upload artifact (original filenames preserved)
+          if [ -s work/failures.txt ]; then { echo ""; echo "### Failed links"; echo '```'; cat work/failures.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          echo "Settings: ${OUT_HEIGHT}p / fps ${FPS} / CRF ${CRF} / preset ${PRESET} / ${AUDIO_ARGS}" >> "$GITHUB_STEP_SUMMARY"
+      - name: 8. Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: av1-run${{ github.run_number }}
@@ -408,7 +271,6 @@ jobs:
           retention-days: 7
           compression-level: 0
           if-no-files-found: error
-
       - name: 9. Google Drive
         if: ${{ inputs.destination == 'drive' || inputs.destination == 'all' }}
         env:
@@ -422,40 +284,30 @@ jobs:
           python3 - <<'PY'
           import json,os,re,sys
           raw=(os.environ.get("GDRIVE_TOKEN") or "").strip() or (os.environ.get("RCLONE_CONFIG") or "").strip()
-          if not raw:
-              sys.exit("ERROR: add a secret GDRIVE_TOKEN containing the {...} line from: rclone authorize \"drive\"")
-          m=re.search(r"\{.*\}", raw, re.S)
-          if not m: sys.exit("ERROR: no {...} token JSON found in the secret")
+          if not raw: sys.exit('ERROR: add secret GDRIVE_TOKEN = the {...} line from: rclone authorize "drive"')
+          m=re.search(r"\{.*\}",raw,re.S)
+          if not m: sys.exit("ERROR: no {...} JSON found in secret")
           s=re.sub(r"\s*[\r\n]+\s*","",m.group(0)).replace("\u201c",'"').replace("\u201d",'"')
           try: tok=json.loads(s)
-          except Exception as e: sys.exit(f"ERROR: token JSON invalid: {e}")
-          if not tok.get("refresh_token"):
-              sys.exit('ERROR: token has no refresh_token. Re-run: rclone authorize "drive" and copy the whole {...}')
-          cid=(os.environ.get("GDRIVE_CLIENT_ID") or "").strip()
-          sec=(os.environ.get("GDRIVE_CLIENT_SECRET") or "").strip()
+          except Exception as e: sys.exit(f"ERROR: bad token JSON: {e}")
+          if not tok.get("refresh_token"): sys.exit('ERROR: no refresh_token - redo: rclone authorize "drive"')
+          cid=(os.environ.get("GDRIVE_CLIENT_ID") or "").strip(); sec=(os.environ.get("GDRIVE_CLIENT_SECRET") or "").strip()
           if not cid:
               mm=re.search(r"^\s*client_id\s*=\s*(\S+)",raw,re.M); cid=mm.group(1) if mm else ""
           if not sec:
               mm=re.search(r"^\s*client_secret\s*=\s*(\S+)",raw,re.M); sec=mm.group(1) if mm else ""
-          lines=["[gdrive]","type = drive","scope = drive"]
-          if cid: lines.append("client_id = "+cid)
-          if sec: lines.append("client_secret = "+sec)
-          lines.append("token = "+json.dumps(tok,separators=(",",":")))
-          p=os.path.expanduser("~/.config/rclone/rclone.conf")
-          os.makedirs(os.path.dirname(p),exist_ok=True)
-          with open(p,"w") as fh: fh.write("\n".join(lines)+"\n")
-          os.chmod(p,0o600)
-          print("rclone config built from token OK")
+          L=["[gdrive]","type = drive","scope = drive"]
+          if cid: L.append("client_id = "+cid)
+          if sec: L.append("client_secret = "+sec)
+          L.append("token = "+json.dumps(tok,separators=(",",":")))
+          p=os.path.expanduser("~/.config/rclone/rclone.conf"); os.makedirs(os.path.dirname(p),exist_ok=True)
+          open(p,"w").write("\n".join(L)+"\n"); os.chmod(p,0o600); print("rclone config built OK")
           PY
           rclone listremotes
           echo "Uploading to Drive folder: ${GDRIVE_FOLDER}"
-          rclone copy dist/ "gdrive:${GDRIVE_FOLDER}" \
-            --drive-chunk-size 64M --transfers 2 --checkers 4 \
-            --retries 5 --low-level-retries 10 --stats 1m --stats-one-line -v
-          rclone lsl "gdrive:${GDRIVE_FOLDER}" > work/listing.txt
-          tail -n 10 work/listing.txt
+          rclone copy dist/ "gdrive:${GDRIVE_FOLDER}" --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 1m --stats-one-line -v
+          rclone lsl "gdrive:${GDRIVE_FOLDER}" > work/listing.txt; tail -n 10 work/listing.txt
           echo "Uploaded to Google Drive / ${GDRIVE_FOLDER}" >> "$GITHUB_STEP_SUMMARY"
-
       - name: 10. Release
         if: ${{ inputs.destination == 'release' || inputs.destination == 'all' }}
         env:
@@ -464,12 +316,4 @@ jobs:
         run: |
           set -euo pipefail
           T="vid-$(date -u +%Y%m%d-%H%M%S)"
-          mapfile -t FILES < <(find dist -maxdepth 1 -type f -name '*.mkv')
-          gh release create "$T" "${FILES[@]}" --title "$T" \
-            --notes "${OUT_HEIGHT}p · CRF ${CRF} · preset ${PRESET} · ${#FILES[@]} file(s)"
-
-      - name: 11. Cleanup
-        if: always()
-        run: |
-          rm -f "$RUNNER_TEMP/cookies.txt" "$HOME/.config/rclone/rclone.conf"
-          pkill -f qbittorrent-nox || true   
+          
