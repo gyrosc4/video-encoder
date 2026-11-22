@@ -1,18 +1,19 @@
-name: Video to AV1 (any site)
+name: Video to AV1 (multi-link + torrents)
 
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: "Video URL — Kick, YouTube, Twitch VOD, X, Reddit, Vimeo... (any yt-dlp site)"
-        required: true
+      urls:
+        description: "Links separated by spaces or commas (magnets OK). Empty = use links.txt in repo"
+        required: false
+        default: ""
         type: string
       minutes:
-        description: "Minutes to keep from the start (5 = quick test, 0 = whole video)"
+        description: "Minutes to keep from the start (0 = whole video)"
         default: "90"
         type: string
       source_height:
-        description: "Source quality to download (1080 -> 720 downscale looks best)"
+        description: "Source quality to download"
         type: choice
         default: "720"
         options: ["720", "1080", "1440", "480", "360", "best"]
@@ -22,28 +23,28 @@ on:
         default: "720"
         options: ["720", "1080", "480", "360", "same"]
       fps:
-        description: "Output fps (0 = keep source, 30 = half the size of 60)"
+        description: "Output fps (0 = keep source)"
         default: "30"
         type: string
       crf:
-        description: "AV1 CRF 0-63 (lower = better/bigger; 28-36 sweet spot)"
+        description: "AV1 CRF 0-63 (lower = better/bigger)"
         default: "32"
         type: string
       preset:
-        description: "SVT-AV1 preset (lower = slower/smaller; 6 = sane)"
+        description: "SVT-AV1 preset (lower = slower/smaller)"
         type: choice
         default: "6"
         options: ["4", "5", "6", "7", "8", "9", "10"]
       audio_kbps:
-        description: "Opus bitrate kbps (0 = copy original audio untouched)"
+        description: "Opus kbps (0 = copy original audio)"
         default: "64"
         type: string
       extra:
-        description: "Advanced ffmpeg flags, e.g. -g 300 -ac 1 -pix_fmt yuv420p"
+        description: "Advanced ffmpeg flags, e.g. -g 300 -ac 1"
         default: ""
         type: string
       destination:
-        description: "Where the file goes (artifact is ALWAYS uploaded as a backup)"
+        description: "Artifact is ALWAYS uploaded as backup; drive/release are extra"
         type: choice
         default: "drive"
         options: ["artifact", "drive", "release", "all"]
@@ -63,7 +64,7 @@ jobs:
     permissions:
       contents: write
     env:
-      URL: ${{ inputs.url }}
+      URLS_IN: ${{ inputs.urls }}
       MINUTES: ${{ inputs.minutes }}
       SOURCE_HEIGHT: ${{ inputs.source_height }}
       OUT_HEIGHT: ${{ inputs.out_height }}
@@ -74,41 +75,34 @@ jobs:
       EXTRA: ${{ inputs.extra }}
       DEST: ${{ inputs.destination }}
       GDRIVE_FOLDER: ${{ vars.GDRIVE_FOLDER || 'KickAV1' }}
+      DEADLINE_MIN: "320"
+      TORRENT_TIMEOUT_MIN: "120"
+      MAX_FILES_PER_TORRENT: "3"
+      MIN_VIDEO_MB: "50"
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: 1. Settings
         run: |
           set -euo pipefail
           M=${MINUTES//[^0-9]/}; M=${M:-90}
-          C=${CRF_IN//[^0-9]/}; C=${C:-32}
-          if [ "$C" -gt 63 ]; then C=63; fi
-          P=${PRESET_IN//[^0-9]/}; P=${P:-6}
-          if [ "$P" -gt 10 ]; then P=10; fi
+          C=${CRF_IN//[^0-9]/}; C=${C:-32}; if [ "$C" -gt 63 ]; then C=63; fi
+          P=${PRESET_IN//[^0-9]/}; P=${P:-6}; if [ "$P" -gt 10 ]; then P=10; fi
           F=${FPS//[^0-9.]/}
           AB=${AUDIO_KBPS//[^0-9]/}
-
           if [ "$SOURCE_HEIGHT" = "best" ]; then SORT="res"; else SORT="res:${SOURCE_HEIGHT}"; fi
-
           SCALE=""
-          if [ "$OUT_HEIGHT" != "same" ]; then
-            SCALE="scale=w=-2:h='min(${OUT_HEIGHT},ih)'"
-          fi
+          if [ "$OUT_HEIGHT" != "same" ]; then SCALE="scale=w=-2:h='min(${OUT_HEIGHT},ih)'"; fi
           VF=""
           if [ -n "$SCALE" ]; then VF="$SCALE"; fi
           if [ -n "$F" ] && [ "$F" != "0" ]; then
             if [ -n "$VF" ]; then VF="${VF},fps=${F}"; else VF="fps=${F}"; fi
           fi
           if [ -z "$VF" ]; then VF="null"; fi
-
-          if [ -z "$AB" ] || [ "$AB" = "0" ]; then
-            AUDIO_ARGS="-c:a copy"; ATAG="copy"
-          else
-            AUDIO_ARGS="-c:a libopus -b:a ${AB}k"; ATAG="opus${AB}"
-          fi
-
-          HTAG="$OUT_HEIGHT"; if [ "$HTAG" = "same" ]; then HTAG="src"; fi
-          FTAG="src"; if [ -n "$F" ] && [ "$F" != "0" ]; then FTAG="$F"; fi
-
+          if [ -z "$AB" ] || [ "$AB" = "0" ]; then AUDIO_ARGS="-c:a copy"; else AUDIO_ARGS="-c:a libopus -b:a ${AB}k"; fi
           {
             echo "MINUTES=$M"
             echo "CUT_SECONDS=$((M*60))"
@@ -118,215 +112,351 @@ jobs:
             echo "CRF=$C"
             echo "PRESET=$P"
             echo "AUDIO_ARGS=$AUDIO_ARGS"
-            echo "TAG=${HTAG}p${FTAG}_${ATAG}"
+            echo "DEADLINE=$(( $(date +%s) + DEADLINE_MIN*60 ))"
           } >> "$GITHUB_ENV"
-          echo "keep ${M}min (0=full) | source ${SORT} | vf ${VF} | crf ${C} | preset ${P} | ${AUDIO_ARGS}"
-          echo "destination: ${DEST} | drive folder: ${GDRIVE_FOLDER}"
+          echo "keep ${M}min | ${SORT} | vf ${VF} | crf ${C} | preset ${P} | ${AUDIO_ARGS}"
 
-      - name: 2. Install ffmpeg (AV1) + yt-dlp + rclone, then self-test
+      - name: 2. Build link list
+        run: |
+          set -euo pipefail
+          mkdir -p work dist
+          printf '%s' "$URLS_IN" | tr ',;' '\n\n' | tr ' ' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' > work/urls.txt || true
+          if [ ! -s work/urls.txt ] && [ -f links.txt ]; then
+            echo "reading links.txt from repo"
+            sed 's/#.*$//' links.txt | tr ',;' '\n\n' | tr ' ' '\n' \
+              | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' > work/urls.txt || true
+          fi
+          if [ ! -s work/urls.txt ]; then echo "ERROR: no links given"; exit 1; fi
+          echo "--- queue ---"; cat -n work/urls.txt
+
+      - name: 3. Install tools + AV1 self-test
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
-          cd /tmp
-          mkdir -p ff
-          echo "--- ffmpeg ---"
+          cd /tmp; mkdir -p ff
           curl -fsSL --retry 5 --retry-delay 5 -o ff.tar.xz \
             https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xf ff.tar.xz -C ff --strip-components=1
-          sudo install -m755 ff/bin/ffmpeg  /usr/local/bin/ffmpeg
+          sudo install -m755 ff/bin/ffmpeg /usr/local/bin/ffmpeg
           sudo install -m755 ff/bin/ffprobe /usr/local/bin/ffprobe
           rm -rf ff ff.tar.xz
-          echo "--- yt-dlp ---"
-          curl -fsSL --retry 5 --retry-delay 5 -o yt-dlp \
+          curl -fsSL --retry 5 -o yt-dlp \
             https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp
-          sudo install -m755 yt-dlp /usr/local/bin/yt-dlp
-          rm -f yt-dlp
-          echo "--- rclone ---"
+          sudo install -m755 yt-dlp /usr/local/bin/yt-dlp; rm -f yt-dlp
           curl -fsSL --retry 5 -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip -q -o rclone.zip -d rc
           sudo install -m755 rc/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
           rm -rf rc rclone.zip
+          if grep -qiE '^magnet:|\.torrent' "$GITHUB_WORKSPACE/work/urls.txt"; then
+            echo "--- torrent links found: installing qbittorrent-nox ---"
+            if curl -fsSL --retry 3 -o qbt \
+                https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox \
+               && chmod +x qbt && ./qbt --version > /dev/null 2>&1; then
+              sudo install -m755 qbt /usr/local/bin/qbittorrent-nox
+            else
+              sudo apt-get update -qq && sudo apt-get install -y -qq qbittorrent-nox
+            fi
+            rm -f qbt
+            qbittorrent-nox --version | head -n1
+          fi
           hash -r
           ffmpeg -hide_banner -version > v.txt; head -n1 v.txt
-          yt-dlp --version
-          rclone version | head -n1
-          echo "--- AV1 self-test (1 second) ---"
-          ffmpeg -hide_banner -loglevel error \
-            -f lavfi -i "testsrc=size=320x240:rate=30" -t 1 \
+          yt-dlp --version; rclone version | head -n1; jq --version
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc=size=320x240:rate=30" -t 1 \
             -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 40 -f null -
           echo "AV1 ENCODER WORKS"
 
-      - name: 3. Cookies (optional secret COOKIES_TXT, or old KICK_COOKIES)
+      - name: 4. Cookies (optional secret COOKIES_TXT)
         env:
           COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
           KICK_COOKIES: ${{ secrets.KICK_COOKIES }}
         run: |
           set -euo pipefail
           printf '# Netscape HTTP Cookie File\n' > "$RUNNER_TEMP/cookies.txt"
-          if [ -n "${COOKIES_TXT:-}" ]; then
-            printf '%s\n' "$COOKIES_TXT" >> "$RUNNER_TEMP/cookies.txt"
-            echo "using COOKIES_TXT secret"
-          elif [ -n "${KICK_COOKIES:-}" ]; then
-            printf '%s\n' "$KICK_COOKIES" >> "$RUNNER_TEMP/cookies.txt"
-            echo "using KICK_COOKIES secret"
-          else
-            echo "no cookies (fine for public videos)"
-          fi
+          if [ -n "${COOKIES_TXT:-}" ]; then printf '%s\n' "$COOKIES_TXT" >> "$RUNNER_TEMP/cookies.txt"
+          elif [ -n "${KICK_COOKIES:-}" ]; then printf '%s\n' "$KICK_COOKIES" >> "$RUNNER_TEMP/cookies.txt"; fi
 
-      - name: 4. Download
+      - name: 5. Start torrent engine (DHT/PEX/LSD/uTP + tracker boost)
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
-          if [ "$MINUTES" = "0" ]; then
-            RANGE=""; echo "Downloading the FULL video"
-          else
-            RANGE="*00:00:00-${END}"; echo "Downloading 00:00:00 -> $END"
-          fi
-          ( while true; do sleep 60; ls -lh source.* 2>/dev/null || true; done ) &
-          HB=$!
-          trap 'kill "$HB" 2>/dev/null || true' EXIT
+          if ! command -v qbittorrent-nox > /dev/null 2>&1; then echo "no torrents in queue, skipping"; exit 0; fi
+          mkdir -p "$HOME/.config/qBittorrent" "$GITHUB_WORKSPACE/dl"
+          cat > "$HOME/.config/qBittorrent/qBittorrent.conf" <<EOF
+          [LegalNotice]
+          Accepted=true
 
-          ok=0
-          if yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" \
-               --no-playlist --no-progress -N 8 \
-               -S "$SORT" \
-               ${RANGE:+--download-sections "$RANGE"} \
-               --remux-video mkv --merge-output-format mkv \
-               --no-part --no-mtime --retries 20 --fragment-retries 30 \
-               --extractor-retries 5 \
-               --print-to-file "%(title)s" title.txt \
-               --print-to-file "%(extractor_key)s" site.txt \
-               -o "source.%(ext)s" "$URL"; then
-            ok=1
+          [Preferences]
+          WebUI\\Enabled=true
+          WebUI\\Address=127.0.0.1
+          WebUI\\Port=8080
+          WebUI\\LocalHostAuth=false
+          WebUI\\CSRFProtection=false
+          WebUI\\HostHeaderValidation=false
+          Downloads\\SavePath=$GITHUB_WORKSPACE/dl
+          Session\\DefaultSavePath=$GITHUB_WORKSPACE/dl
+          EOF
+          curl -fsSL --retry 3 -o work/trackers_raw.txt \
+            https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt || \
+            printf '%s\n' \
+              "udp://tracker.opentrackr.org:1337/announce" \
+              "udp://open.demonii.com:1337/announce" \
+              "udp://open.stealth.si:80/announce" \
+              "udp://exodus.desync.com:6969/announce" \
+              "udp://tracker.torrent.eu.org:451/announce" > work/trackers_raw.txt
+          grep -v '^[[:space:]]*$' work/trackers_raw.txt | sort -u > work/tr.txt
+          echo "trackers loaded: $(wc -l < work/tr.txt)"
+          nohup qbittorrent-nox --webui-port=8080 > work/qbt.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8080/api/v2/app/version > /dev/null; then break; fi
+            sleep 2
+          done
+          if ! curl -sf http://127.0.0.1:8080/api/v2/app/version > /dev/null; then
+            echo "qBittorrent API did not come up"; tail -n 40 work/qbt.log; exit 1
           fi
+          jq -n --arg tr "$(cat work/tr.txt)" '{
+            dht:true, pex:true, lsd:true,
+            max_connec:1000, max_connec_per_torrent:300,
+            max_uploads:-1, max_uploads_per_torrent:-1,
+            anonymous_mode:false, encryption:0, bittorrent_protocol:0,
+            limit_utp_rate:false, upnp:false, random_port:false, listen_port:6881,
+            add_trackers:true, add_trackers_enabled:true, additional_trackers:$tr,
+            slow_torrent_dl_rate_threshold:0
+          }' > work/prefs.json
+          curl -s -X POST http://127.0.0.1:8080/api/v2/app/setPreferences \
+            --data-urlencode "json@work/prefs.json" > /dev/null
+          echo "torrent engine ready: $(curl -s http://127.0.0.1:8080/api/v2/app/version)"
+             - name: 6. Process every link
+        run: |
+          set -uo pipefail
+          export PATH="/usr/local/bin:$PATH"
+          API=http://127.0.0.1:8080/api/v2
+          mkdir -p dist work
+          : > work/failures.txt
 
-          if [ "$ok" -ne 1 ] || ! ls source.* > /dev/null 2>&1; then
-            echo "=== plan A failed, trying plan B (direct stream + ffmpeg) ==="
-            rm -f source.* || true
-            yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist \
-              -S "$SORT" -g "$URL" > urls.txt
-            DIRECT=$(head -n1 urls.txt)
-            yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --skip-download \
-              --print-to-file "%(title)s" title.txt \
-              --print-to-file "%(extractor_key)s" site.txt "$URL" || true
-            ORIGIN=$(printf '%s' "$URL" | sed -E 's#^(https?://[^/]+).*#\1#')
-            TARGS=()
-            if [ "$MINUTES" != "0" ]; then TARGS=(-t "$CUT_SECONDS"); fi
-            ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 \
-              -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-              -headers "Referer: ${ORIGIN}/"$'\r\n' \
-              -i "$DIRECT" "${TARGS[@]}" \
-              -map 0:v:0 -map 0:a:0? -c copy -y source.mkv
-          fi
+          sanitize() {
+            local s="$1"
+            s=$(printf '%s' "$s" | tr -d '\000-\037' | sed 's#[/\\:*?"<>|]# #g')
+            s=$(printf '%s' "$s" | sed 's/  */ /g; s/^ *//; s/ *$//; s/\.+$//')
+            s="${s:0:120}"
+            if [ -z "$s" ]; then s="video"; fi
+            printf '%s' "$s"
+          }
 
-          kill "$HB" 2>/dev/null || true
-          if [ ! -f source.mkv ]; then
-            shopt -s nullglob
-            for f in source.*; do
-              ffmpeg -hide_banner -loglevel error -y -i "$f" -c copy source.mkv
-              rm -f "$f"; break
+          encode_file() {
+            local src="$1" name="$2" out n=2
+            out="dist/${name}.mkv"
+            while [ -e "$out" ]; do out="dist/${name} (${n}).mkv"; n=$((n+1)); done
+            local targs=()
+            if [ "$MINUTES" != "0" ]; then targs=(-t "$CUT_SECONDS"); fi
+            echo ">>> encoding: $name"
+            ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -y \
+              -err_detect ignore_err -i "$src" \
+              -map 0:v:0 -map 0:a:0? -map_metadata -1 -map_chapters -1 \
+              -vf "$VF" -pix_fmt yuv420p10le \
+              -c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 240 \
+              -svtav1-params "tune=0:lp=$(nproc):enable-overlays=1" \
+              $AUDIO_ARGS "${targs[@]}" $EXTRA "$out"
+            if [ -s "$out" ]; then echo "OK: $out"; return 0; fi
+            rm -f "$out"; echo "ENCODE FAILED: $name"; return 1
+          }
+
+          handle_web() {
+            local u="$1" d title
+            rm -f work/src.* work/title.txt
+            local rargs=()
+            if [ "$MINUTES" != "0" ]; then rargs=(--download-sections "*00:00:00-${END}"); fi
+            if ! yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --no-progress -N 8 \
+                 -S "$SORT" "${rargs[@]}" \
+                 --remux-video mkv --merge-output-format mkv --no-part --no-mtime \
+                 --retries 20 --fragment-retries 30 --extractor-retries 5 \
+                 --print-to-file "%(title)s" work/title.txt \
+                 -o "work/src.%(ext)s" "$u"; then
+              echo "plan A failed -> plan B (direct stream)"
+              rm -f work/src.*
+              yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist -S "$SORT" -g "$u" > work/direct.txt || return 1
+              d=$(head -n1 work/direct.txt)
+              yt-dlp --cookies "$RUNNER_TEMP/cookies.txt" --no-playlist --skip-download \
+                --print-to-file "%(title)s" work/title.txt "$u" || true
+              local ta=()
+              if [ "$MINUTES" != "0" ]; then ta=(-t "$CUT_SECONDS"); fi
+              local org; org=$(printf '%s' "$u" | sed -E 's#^(https?://[^/]+).*#\1#')
+              ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 \
+                -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+                -headers "Referer: ${org}/"$'\r\n' \
+                -i "$d" "${ta[@]}" -map 0:v:0 -map 0:a:0? -c copy -y work/src.mkv || return 1
+            fi
+            if [ ! -f work/src.mkv ]; then
+              shopt -s nullglob
+              for f in work/src.*; do
+                ffmpeg -hide_banner -loglevel error -y -i "$f" -c copy work/src.mkv && rm -f "$f"
+                break
+              done
+            fi
+            if [ ! -s work/src.mkv ]; then echo "nothing downloaded"; return 1; fi
+            title=$(head -n1 work/title.txt 2>/dev/null || echo "")
+            if [ -z "$title" ]; then title="video_$(date +%s)"; fi
+            encode_file work/src.mkv "$(sanitize "$title")"
+          }
+
+          handle_torrent() {
+            local u="$1" h resp dl="$GITHUB_WORKSPACE/dl/$RANDOM$RANDOM"
+            mkdir -p "$dl"
+            if printf '%s' "$u" | grep -qi '^magnet:'; then
+              resp=$(curl -s -X POST "$API/torrents/add" -F "urls=$u" -F "savepath=$dl" \
+                     -F "autoTMM=false" -F "sequentialDownload=true" -F "firstLastPiecePrio=true" -F "paused=false")
+            else
+              curl -fsSL --retry 3 -o work/in.torrent "$u" || { echo "cannot fetch .torrent"; return 1; }
+              resp=$(curl -s -X POST "$API/torrents/add" -F "torrents=@work/in.torrent" -F "savepath=$dl" \
+                     -F "autoTMM=false" -F "sequentialDownload=true" -F "firstLastPiecePrio=true" -F "paused=false")
+            fi
+            echo "add: $resp"
+            sleep 5
+            h=$(curl -s "$API/torrents/info?sort=added_on&reverse=true" | jq -r '.[0].hash // empty')
+            if [ -z "$h" ]; then echo "torrent not added"; return 1; fi
+            curl -s -X POST "$API/torrents/addTrackers" \
+              --data-urlencode "hash=$h" --data-urlencode "urls@work/tr.txt" > /dev/null
+            curl -s -X POST "$API/torrents/resume" --data-urlencode "hashes=$h" > /dev/null || true
+            curl -s -X POST "$API/torrents/start"  --data-urlencode "hashes=$h" > /dev/null || true
+            local limit=$(( $(date +%s) + TORRENT_TIMEOUT_MIN*60 ))
+            local finished=0 p=0 st sp sd
+            while :; do
+              local j; j=$(curl -s "$API/torrents/info?hashes=$h")
+              p=$(printf '%s' "$j" | jq -r '.[0].progress // 0')
+              st=$(printf '%s' "$j" | jq -r '.[0].state // "?"')
+              sp=$(printf '%s' "$j" | jq -r '.[0].dlspeed // 0')
+              sd=$(printf '%s' "$j" | jq -r '.[0].num_seeds // 0')
+              printf 'torrent %s  %s%%  state=%s  seeds=%s  %s KB/s\n' \
+                "${h:0:8}" "$(awk -v x="$p" 'BEGIN{printf "%.1f", x*100}')" "$st" "$sd" "$((sp/1024))"
+              if awk -v x="$p" 'BEGIN{exit !(x>=0.999)}'; then finished=1; break; fi
+              case "$st" in error|missingFiles) echo "torrent error state"; break;; esac
+              if [ "$(date +%s)" -ge "$limit" ] || [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                echo "torrent time budget reached"; break
+              fi
+              sleep 60
             done
-          fi
-          if [ ! -s source.mkv ]; then
-            echo "FAILED: nothing downloaded."
-            echo "- Is the URL a video page (not a channel/profile)?"
-            echo "- Login/age-restricted? Add a COOKIES_TXT secret."
-            exit 1
-          fi
-          ls -lh source.mkv
-          ffprobe -v error -show_entries stream=codec_name,width,height,r_frame_rate \
-            -of default=noprint_wrappers=1 source.mkv
+            curl -s -X POST "$API/torrents/pause" --data-urlencode "hashes=$h" > /dev/null || true
+            curl -s -X POST "$API/torrents/stop"  --data-urlencode "hashes=$h" > /dev/null || true
+            find "$dl" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.ts' \
+              -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.m4v' -o -iname '*.wmv' -o -iname '*.flv' \) \
+              -size +${MIN_VIDEO_MB}M -printf '%s\t%p\n' | sort -rn > work/tfiles.txt
+            if [ ! -s work/tfiles.txt ]; then echo "no usable video files in torrent"; rm -rf "$dl"; return 1; fi
+            if [ "$finished" != "1" ]; then
+              echo "NOTE: incomplete torrent - encoding what arrived (start of file lands first)"
+            fi
+            local count=0 sz path base
+            while IFS=$'\t' read -r sz path; do
+              case "$path" in *sample*|*Sample*|*SAMPLE*) continue;; esac
+              if [ "$count" -ge "$MAX_FILES_PER_TORRENT" ]; then break; fi
+              base=$(basename "$path"); base="${base%.*}"
+              encode_file "$path" "$(sanitize "$base")" || true
+              count=$((count+1))
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then break; fi
+            done < work/tfiles.txt
+            curl -s -X POST "$API/torrents/delete" \
+              --data-urlencode "hashes=$h" --data-urlencode "deleteFiles=true" > /dev/null || true
+            rm -rf "$dl"
+            return 0
+          }
 
-      - name: 5. Encode
-        id: enc
-        run: |
-          set -euo pipefail
-          export PATH="/usr/local/bin:$PATH"
-          mkdir -p dist
-          RAW=$(cat title.txt 2>/dev/null || echo video)
-          SITE=$(cat site.txt 2>/dev/null || echo vid)
-          SAFE=$(printf '%s' "$RAW" | tr -d '\r\n' | sed 's/[^A-Za-z0-9._-]\+/_/g' | cut -c1-50)
-          SITE=$(printf '%s' "$SITE" | tr -cd 'A-Za-z0-9' | cut -c1-12)
-          SAFE=${SAFE:-video}; SITE=${SITE:-vid}
-          OUT="dist/${SITE}_${SAFE}_${TAG}_first${MINUTES}min_crf${CRF}-p${PRESET}.mkv"
-          echo "Output: $OUT"
-          ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -y \
-            -i source.mkv \
-            -map 0:v:0 -map 0:a:0? -map_metadata -1 -map_chapters -1 \
-            -vf "$VF" -pix_fmt yuv420p10le \
-            -c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 240 \
-            -svtav1-params "tune=0:lp=$(nproc):enable-overlays=1" \
-            $AUDIO_ARGS \
-            $EXTRA \
-            "$OUT"
-          [ -s "$OUT" ] || { echo "FAILED: encode produced nothing"; exit 1; }
-          echo "out=$OUT" >> "$GITHUB_OUTPUT"
-
-      - name: 6. Report
-        env:
-          OUT_PATH: ${{ steps.enc.outputs.out }}
-        run: |
-          set -euo pipefail
-          export PATH="/usr/local/bin:$PATH"
-          SRC=$(stat -c%s source.mkv)
-          OUT=$(stat -c%s "$OUT_PATH")
-          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT_PATH")
-          MINS=$(awk -v d="$DUR" 'BEGIN{printf "%.1f", d/60}')
-          PCT=$(awk -v s="$SRC" -v o="$OUT" 'BEGIN{if(s>0)printf "%d",100-(o*100/s); else print 0}')
-          BR=$(awk -v o="$OUT" -v d="$DUR" 'BEGIN{if(d>0)printf "%d",o*8/d/1000; else print 0}')
-          {
-            echo "## Done"
-            echo "| | |"; echo "|---|---|"
-            echo "| Length | ${MINS} min |"
-            echo "| Source | ${SOURCE_HEIGHT} · $((SRC/1048576)) MB |"
-            echo "| Output | ${TAG} · CRF ${CRF} · preset ${PRESET} · $((OUT/1048576)) MB |"
-            echo "| Total bitrate | ${BR} kbps |"
-            echo "| Space saved | ${PCT}% |"
-            echo "| Destination | ${DEST} |"
+          i=0
+          while IFS= read -r u; do
+            if [ -z "$u" ]; then continue; fi
+            i=$((i+1))
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then echo "TIME BUDGET REACHED - stopping queue"; break; fi
             echo ""
-            echo "Backup copy is in **Artifacts** at the bottom of this page."
-          } >> "$GITHUB_STEP_SUMMARY"
-          ls -lh dist/
+            echo "==================== [$i] $u"
+            if printf '%s' "$u" | grep -qiE '^magnet:|\.torrent'; then
+              handle_torrent "$u" || printf '%s\n' "$u" >> work/failures.txt
+            else
+              handle_web "$u" || printf '%s\n' "$u" >> work/failures.txt
+            fi
+            rm -f work/src.* || true
+            df -h . | tail -n1
+          done < work/urls.txt
 
-      - name: 7. Upload artifact (always, safety net)
+          echo ""; echo "=== OUTPUT ==="; ls -lh dist/ || true
+          if ! ls dist/*.mkv > /dev/null 2>&1; then echo "NOTHING PRODUCED"; exit 1; fi
+
+      - name: 7. Report
+        run: |
+          set -uo pipefail
+          export PATH="/usr/local/bin:$PATH"
+          {
+            echo "## Results"
+            echo "| File | Length | Size |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in dist/*.mkv; do
+            [ -e "$f" ] || continue
+            D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo 0)
+            S=$(stat -c%s "$f")
+            printf '| %s | %s min | %s MB |\n' "$(basename "$f")" \
+              "$(awk -v d="$D" 'BEGIN{printf "%.1f", d/60}')" "$((S/1048576))" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ -s work/failures.txt ]; then
+            { echo ""; echo "### Failed links"; echo '```'; cat work/failures.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Settings: ${OUT_HEIGHT}p · fps ${FPS} · CRF ${CRF} · preset ${PRESET} · ${AUDIO_ARGS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 8. Upload artifact (original filenames preserved)
         uses: actions/upload-artifact@v4
         with:
-          name: av1-${{ inputs.out_height }}p-run${{ github.run_number }}
-          path: dist/*.mkv
+          name: av1-run${{ github.run_number }}
+          path: dist/
           retention-days: 7
           compression-level: 0
           if-no-files-found: error
 
-      - name: 8. Upload to Google Drive
+      - name: 9. Google Drive
         if: ${{ inputs.destination == 'drive' || inputs.destination == 'all' }}
         env:
-          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_TOKEN: ${{ secrets.GDRIVE_TOKEN }}
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
-          if [ -z "${RCLONE_CONFIG_TEXT:-}" ]; then
-            echo "ERROR: no RCLONE_CONFIG secret. Add it (see setup) or pick destination=artifact."
-            exit 1
-          fi
-          mkdir -p "$HOME/.config/rclone"
-          printf '%s\n' "$RCLONE_CONFIG_TEXT" > "$HOME/.config/rclone/rclone.conf"
-          chmod 600 "$HOME/.config/rclone/rclone.conf"
-          echo "remotes found:"; rclone listremotes
-          if ! rclone listremotes | grep -q '^gdrive:$'; then
-            echo "ERROR: your secret must contain a remote named [gdrive]"
-            exit 1
-          fi
+          python3 - <<'PY'
+          import json,os,re,sys
+          raw=(os.environ.get("GDRIVE_TOKEN") or "").strip() or (os.environ.get("RCLONE_CONFIG") or "").strip()
+          if not raw:
+              sys.exit("ERROR: add a secret GDRIVE_TOKEN containing the {...} line from: rclone authorize \"drive\"")
+          m=re.search(r"\{.*\}", raw, re.S)
+          if not m: sys.exit("ERROR: no {...} token JSON found in the secret")
+          s=re.sub(r"\s*[\r\n]+\s*","",m.group(0)).replace("\u201c",'"').replace("\u201d",'"')
+          try: tok=json.loads(s)
+          except Exception as e: sys.exit(f"ERROR: token JSON invalid: {e}")
+          if not tok.get("refresh_token"):
+              sys.exit('ERROR: token has no refresh_token. Re-run: rclone authorize "drive" and copy the whole {...}')
+          cid=(os.environ.get("GDRIVE_CLIENT_ID") or "").strip()
+          sec=(os.environ.get("GDRIVE_CLIENT_SECRET") or "").strip()
+          if not cid:
+              mm=re.search(r"^\s*client_id\s*=\s*(\S+)",raw,re.M); cid=mm.group(1) if mm else ""
+          if not sec:
+              mm=re.search(r"^\s*client_secret\s*=\s*(\S+)",raw,re.M); sec=mm.group(1) if mm else ""
+          lines=["[gdrive]","type = drive","scope = drive"]
+          if cid: lines.append("client_id = "+cid)
+          if sec: lines.append("client_secret = "+sec)
+          lines.append("token = "+json.dumps(tok,separators=(",",":")))
+          p=os.path.expanduser("~/.config/rclone/rclone.conf")
+          os.makedirs(os.path.dirname(p),exist_ok=True)
+          with open(p,"w") as fh: fh.write("\n".join(lines)+"\n")
+          os.chmod(p,0o600)
+          print("rclone config built from token OK")
+          PY
+          rclone listremotes
           echo "Uploading to Drive folder: ${GDRIVE_FOLDER}"
           rclone copy dist/ "gdrive:${GDRIVE_FOLDER}" \
-            --drive-chunk-size 64M --transfers 1 --checkers 4 \
-            --retries 5 --low-level-retries 10 \
-            --stats 1m --stats-one-line -v
-          echo "--- folder contents ---"
-          rclone lsl "gdrive:${GDRIVE_FOLDER}" > listing.txt
-          tail -n 5 listing.txt
+            --drive-chunk-size 64M --transfers 2 --checkers 4 \
+            --retries 5 --low-level-retries 10 --stats 1m --stats-one-line -v
+          rclone lsl "gdrive:${GDRIVE_FOLDER}" > work/listing.txt
+          tail -n 10 work/listing.txt
           echo "Uploaded to Google Drive / ${GDRIVE_FOLDER}" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 9. Put in Release
+      - name: 10. Release
         if: ${{ inputs.destination == 'release' || inputs.destination == 'all' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -334,10 +464,12 @@ jobs:
         run: |
           set -euo pipefail
           T="vid-$(date -u +%Y%m%d-%H%M%S)"
-          gh release create "$T" dist/*.mkv --title "$T" \
-            --notes "${TAG} · CRF ${CRF} preset ${PRESET} · ${URL}"
+          mapfile -t FILES < <(find dist -maxdepth 1 -type f -name '*.mkv')
+          gh release create "$T" "${FILES[@]}" --title "$T" \
+            --notes "${OUT_HEIGHT}p · CRF ${CRF} · preset ${PRESET} · ${#FILES[@]} file(s)"
 
-      - name: 10. Cleanup secrets
+      - name: 11. Cleanup
         if: always()
         run: |
           rm -f "$RUNNER_TEMP/cookies.txt" "$HOME/.config/rclone/rclone.conf"
+          pkill -f qbittorrent-nox || true   
