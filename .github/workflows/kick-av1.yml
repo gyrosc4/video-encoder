@@ -280,18 +280,25 @@ jobs:
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
           RAW="${GDRIVE_TOKEN:-}"; if [ -z "$RAW" ]; then RAW="${RCLONE_CONFIG:-}"; fi
-          if [ -z "$RAW" ]; then echo "ERROR: add secret GDRIVE_TOKEN = the {...} line from rclone authorize drive"; exit 1; fi
-          FLAT=$(printf '%s' "$RAW" | tr -d '\r\n' | sed 's/^[^{]*//; s/[^}]*$//')
-          if [ -z "$FLAT" ]; then echo "ERROR: no {...} token JSON in that secret"; exit 1; fi
-          TOK=$(printf '%s' "$FLAT" | jq -c .) || { echo "ERROR: token JSON malformed - recopy it"; exit 1; }
-          if [ -z "$(printf '%s' "$TOK" | jq -r '.refresh_token // empty')" ]; then echo "ERROR: no refresh_token - redo rclone authorize drive"; exit 1; fi
+          if [ -z "$RAW" ]; then echo "ERROR: add secret GDRIVE_TOKEN"; exit 1; fi
+          TOK=$(printf '%s' "$RAW" | tr -d '\r\n' | sed 's/^[^{]*//; s/[^}]*$//')
+          if [ "${TOK:0:1}" != "{" ] || [ "${TOK: -1}" != "}" ]; then echo "ERROR: secret must contain the {...} token JSON"; exit 1; fi
+          echo "::add-mask::$TOK"
+          RT=$(printf '%s' "$TOK" | sed -n 's/.*"refresh_token" *: *"\([^"]*\)".*/\1/p')
+          if [ -z "$RT" ]; then echo "ERROR: no refresh_token - redo: rclone authorize drive"; exit 1; fi
+          echo "::add-mask::$RT"
+          AT=$(printf '%s' "$TOK" | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')
+          if [ -n "$AT" ]; then echo "::add-mask::$AT"; fi
           CID="${GDRIVE_CLIENT_ID:-}"; SEC="${GDRIVE_CLIENT_SECRET:-}"
           if [ -z "$CID" ]; then CID=$(printf '%s\n' "$RAW" | sed -n 's/^ *client_id *= *\([^ ]*\).*/\1/p' | head -n1); fi
           if [ -z "$SEC" ]; then SEC=$(printf '%s\n' "$RAW" | sed -n 's/^ *client_secret *= *\([^ ]*\).*/\1/p' | head -n1); fi
+          if [ -n "$SEC" ]; then echo "::add-mask::$SEC"; fi
           mkdir -p "$HOME/.config/rclone"
-          { echo "[gdrive]"; echo "type = drive"; echo "scope = drive"; if [ -n "$CID" ]; then echo "client_id = $CID"; fi; if [ -n "$SEC" ]; then echo "client_secret = $SEC"; fi; echo "token = $TOK"; } > "$HOME/.config/rclone/rclone.conf"
+          { echo "[gdrive]"; echo "type = drive"; echo "scope = drive"; if [ -n "$CID" ]; then echo "client_id = $CID"; fi; if [ -n "$SEC" ]; then echo "client_secret = $SEC"; fi; printf 'token = %s\n' "$TOK"; } > "$HOME/.config/rclone/rclone.conf"
           chmod 600 "$HOME/.config/rclone/rclone.conf"
-          echo "rclone config built OK"; rclone about "gdrive:" || true
+          echo "config written"
+          if ! rclone about "gdrive:" > work/acct.txt 2> work/err.txt; then echo "ERROR: rclone auth failed - token invalid or revoked"; sed 's#[A-Za-z0-9_/-]\{30,\}#[REDACTED]#g' work/err.txt; exit 1; fi
+          cat work/acct.txt
           echo "DRIVE TARGET FOLDER = [${GDRIVE_FOLDER}]"
           rclone mkdir "gdrive:${GDRIVE_FOLDER}"
           rclone copy dist/ "gdrive:${GDRIVE_FOLDER}" --drive-chunk-size 64M --transfers 2 --retries 5 --low-level-retries 10 --stats 1m --stats-one-line -v
@@ -303,8 +310,6 @@ jobs:
           { echo ""; echo "### Google Drive"; echo "Folder \`${GDRIVE_FOLDER}\` — all files verified"; } >> "$GITHUB_STEP_SUMMARY"
           FID=$(rclone lsf "gdrive:" --dirs-only --format ip --separator '|' 2>/dev/null | awk -F'|' -v n="${GDRIVE_FOLDER}/" '$2==n{print $1; exit}' || true)
           if [ -n "$FID" ]; then echo "Open folder: https://drive.google.com/drive/folders/${FID}" >> "$GITHUB_STEP_SUMMARY"; fi
-          Q=$(jq -rn --arg q "$(basename "$(find dist -maxdepth 1 -type f -name '*.mkv' | head -n1)")" '$q|@uri')
-          echo "Find file: https://drive.google.com/drive/search?q=${Q}" >> "$GITHUB_STEP_SUMMARY"
       - name: 10. Release
         if: ${{ inputs.destination == 'release' || inputs.destination == 'all' }}
         env:
