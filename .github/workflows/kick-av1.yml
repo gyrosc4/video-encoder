@@ -10,7 +10,7 @@ on:
       crf: {description: "AV1 CRF 0-63 (lower = better/bigger)", default: "32", type: string}
       preset: {description: "SVT preset (lower = slower/smaller)", type: choice, default: "6", options: ["4","5","6","7","8","9","10"]}
       audio_kbps: {description: "Opus kbps (0 = copy original audio)", default: "64", type: string}
-      extra: {description: "Extra ffmpeg flags e.g. -g 300 -ac 1", default: "", type: string}
+      extra: {description: "Extra ffmpeg flags e.g. -g 300 -ac 6 -mapping_family 1", default: "", type: string}
       destination: {description: "Artifact always uploaded; drive/release are extra", type: choice, default: "drive", options: ["artifact","drive","release","all"]}
 concurrency: {group: video-av1, cancel-in-progress: false}
 defaults: {run: {shell: bash}}
@@ -52,7 +52,7 @@ jobs:
             if [ -n "$VF" ]; then VF="${VF},fps=${F}"; else VF="fps=${F}"; fi
           fi
           if [ -z "$VF" ]; then VF="null"; fi
-          if [ -z "$AB" ] || [ "$AB" = "0" ]; then AUDIO_ARGS="-c:a copy"; else AUDIO_ARGS="-c:a libopus -b:a ${AB}k"; fi
+          if [ -z "$AB" ] || [ "$AB" = "0" ]; then AUDIO_ARGS="-c:a copy"; else AUDIO_ARGS="-c:a libopus -b:a ${AB}k -ac 2 -ar 48000"; fi
           { echo "MINUTES=$M"; echo "CUT_SECONDS=$((M*60))"
             printf 'END=%02d:%02d:%02d\n' $((M/60)) $((M%60)) 0
             echo "SORT=$SORT"; echo "VF=$VF"; echo "CRF=$C"; echo "PRESET=$P"; echo "AUDIO_ARGS=$AUDIO_ARGS"
@@ -68,7 +68,7 @@ jobs:
           fi
           if [ ! -s work/urls.txt ]; then echo "ERROR: no links given"; exit 1; fi
           echo "--- queue ---"; cat -n work/urls.txt
-      - name: 3. Install tools + AV1 self-test
+      - name: 3. Install tools + full self-test
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
@@ -95,8 +95,9 @@ jobs:
           hash -r
           ffmpeg -hide_banner -version > v.txt; head -n1 v.txt
           yt-dlp --version; rclone version | head -n1; jq --version
-          ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc=size=320x240:rate=30" -t 1 -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 40 -f null -
-          echo "AV1 ENCODER WORKS"
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc=size=320x240:rate=30" -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 1 -map 0:v:0 -map 1:a:0 -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 40 -c:a libopus -b:a 64k -ac 2 -ar 48000 -f matroska -y /tmp/selftest.mkv
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 1 -c:a aac -b:a 128k -ac 2 -f matroska -y /tmp/selftest2.mkv
+          echo "SELF-TEST PASSED: AV1 + Opus + AAC fallback all work"
       - name: 4. Cookies
         env:
           COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
@@ -142,7 +143,7 @@ jobs:
           set -uo pipefail
           export PATH="/usr/local/bin:$PATH"
           API=http://127.0.0.1:8080/api/v2
-          mkdir -p dist work; : > work/failures.txt
+          mkdir -p dist work; : > work/failures.txt; : > work/notes.txt
           sanitize() {
             local s="$1"
             s=$(printf '%s' "$s" | tr -d '\000-\037' | sed 's#[/\\:*?"<>|]# #g')
@@ -156,9 +157,15 @@ jobs:
             while [ -e "$out" ]; do out="dist/${name} (${n}).mkv"; n=$((n+1)); done
             local targs=()
             if [ "$MINUTES" != "0" ]; then targs=(-t "$CUT_SECONDS"); fi
+            local base=(-hide_banner -loglevel warning -stats -stats_period 60 -y -err_detect ignore_err -i "$src" -map 0:v:0 -map 0:a:0? -map_metadata -1 -map_chapters -1 -vf "$VF" -pix_fmt yuv420p10le -c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 240 -svtav1-params "tune=0:lp=$(nproc):enable-overlays=1")
             echo ">>> encoding: $name"
-            ffmpeg -hide_banner -loglevel warning -stats -stats_period 60 -y -err_detect ignore_err -i "$src" -map 0:v:0 -map 0:a:0? -map_metadata -1 -map_chapters -1 -vf "$VF" -pix_fmt yuv420p10le -c:v libsvtav1 -preset "$PRESET" -crf "$CRF" -g 240 -svtav1-params "tune=0:lp=$(nproc):enable-overlays=1" $AUDIO_ARGS "${targs[@]}" $EXTRA "$out"
-            if [ -s "$out" ]; then echo "OK: $out"; return 0; fi
+            ffmpeg "${base[@]}" $AUDIO_ARGS "${targs[@]}" $EXTRA "$out" && [ -s "$out" ] && { echo "OK: $out"; return 0; }
+            echo "retry 1: stereo AAC 128k"
+            rm -f "$out"
+            ffmpeg "${base[@]}" -c:a aac -b:a 128k -ac 2 -ar 48000 "${targs[@]}" "$out" && [ -s "$out" ] && { echo "OK (AAC): $out"; printf '%s — used stereo AAC fallback\n' "$name" >> work/notes.txt; return 0; }
+            echo "retry 2: video only, audio dropped"
+            rm -f "$out"
+            ffmpeg "${base[@]}" -an "${targs[@]}" "$out" && [ -s "$out" ] && { echo "OK (NO AUDIO): $out"; printf '%s — AUDIO DROPPED, source track unusable\n' "$name" >> work/notes.txt; return 0; }
             rm -f "$out"; echo "ENCODE FAILED: $name"; return 1
           }
           handle_web() {
@@ -221,18 +228,20 @@ jobs:
             curl -s -X POST "$API/torrents/stop" --data-urlencode "hashes=$h" > /dev/null || true
             find "$dl" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.ts' -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.m4v' -o -iname '*.wmv' -o -iname '*.flv' \) -size +${MIN_VIDEO_MB}M -printf '%s\t%p\n' | sort -rn > work/tfiles.txt
             if [ ! -s work/tfiles.txt ]; then echo "no usable video files"; rm -rf "$dl"; return 1; fi
-            if [ "$finished" != "1" ]; then echo "NOTE: incomplete torrent - encoding what arrived"; fi
-            local count=0 sz path base
+            if [ "$finished" != "1" ]; then echo "NOTE: incomplete torrent - encoding what arrived"; printf 'torrent %s — only partial data arrived\n' "${h:0:8}" >> work/notes.txt; fi
+            local count=0 okc=0 sz path base
             while IFS=$'\t' read -r sz path; do
               case "$path" in *sample*|*Sample*|*SAMPLE*) continue;; esac
               if [ "$count" -ge "$MAX_FILES_PER_TORRENT" ]; then break; fi
               base=$(basename "$path"); base="${base%.*}"
-              encode_file "$path" "$(sanitize "$base")" || true
+              if encode_file "$path" "$(sanitize "$base")"; then okc=$((okc+1)); fi
               count=$((count+1))
               if [ "$(date +%s)" -ge "$DEADLINE" ]; then break; fi
             done < work/tfiles.txt
             curl -s -X POST "$API/torrents/delete" --data-urlencode "hashes=$h" --data-urlencode "deleteFiles=true" > /dev/null || true
-            rm -rf "$dl"; return 0
+            rm -rf "$dl"
+            if [ "$okc" -eq 0 ]; then return 1; fi
+            return 0
           }
           i=0
           while IFS= read -r u; do
@@ -251,6 +260,7 @@ jobs:
           echo ""; echo "=== OUTPUT ==="; ls -lh dist/ || true
           if ! ls dist/*.mkv > /dev/null 2>&1; then echo "NOTHING PRODUCED"; exit 1; fi
       - name: 7. Report
+        if: ${{ always() }}
         run: |
           set -uo pipefail
           export PATH="/usr/local/bin:$PATH"
@@ -261,16 +271,18 @@ jobs:
             S=$(stat -c%s "$f")
             printf '| %s | %s min | %s MB |\n' "$(basename "$f")" "$(awk -v d="$D" 'BEGIN{printf "%.1f", d/60}')" "$((S/1048576))" >> "$GITHUB_STEP_SUMMARY"
           done
+          if [ -s work/notes.txt ]; then { echo ""; echo "### Notes"; echo '```'; cat work/notes.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           if [ -s work/failures.txt ]; then { echo ""; echo "### Failed links"; echo '```'; cat work/failures.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           echo "Settings: ${OUT_HEIGHT}p / fps ${FPS} / CRF ${CRF} / preset ${PRESET} / ${AUDIO_ARGS}" >> "$GITHUB_STEP_SUMMARY"
       - name: 8. Upload artifact
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: av1-run${{ github.run_number }}
           path: dist/
           retention-days: 7
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: warn
       - name: 9. Google Drive
         if: ${{ inputs.destination == 'drive' || inputs.destination == 'all' }}
         env:
@@ -293,27 +305,4 @@ jobs:
           if not tok.get("refresh_token"): sys.exit('ERROR: no refresh_token - redo: rclone authorize "drive"')
           cid=(os.environ.get("GDRIVE_CLIENT_ID") or "").strip(); sec=(os.environ.get("GDRIVE_CLIENT_SECRET") or "").strip()
           if not cid:
-              mm=re.search(r"^\s*client_id\s*=\s*(\S+)",raw,re.M); cid=mm.group(1) if mm else ""
-          if not sec:
-              mm=re.search(r"^\s*client_secret\s*=\s*(\S+)",raw,re.M); sec=mm.group(1) if mm else ""
-          L=["[gdrive]","type = drive","scope = drive"]
-          if cid: L.append("client_id = "+cid)
-          if sec: L.append("client_secret = "+sec)
-          L.append("token = "+json.dumps(tok,separators=(",",":")))
-          p=os.path.expanduser("~/.config/rclone/rclone.conf"); os.makedirs(os.path.dirname(p),exist_ok=True)
-          open(p,"w").write("\n".join(L)+"\n"); os.chmod(p,0o600); print("rclone config built OK")
-          PY
-          rclone listremotes
-          echo "Uploading to Drive folder: ${GDRIVE_FOLDER}"
-          rclone copy dist/ "gdrive:${GDRIVE_FOLDER}" --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 1m --stats-one-line -v
-          rclone lsl "gdrive:${GDRIVE_FOLDER}" > work/listing.txt; tail -n 10 work/listing.txt
-          echo "Uploaded to Google Drive / ${GDRIVE_FOLDER}" >> "$GITHUB_STEP_SUMMARY"
-      - name: 10. Release
-        if: ${{ inputs.destination == 'release' || inputs.destination == 'all' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          T="vid-$(date -u +%Y%m%d-%H%M%S)"
-          
+              mm=re.search(r"^\s*client_id\s*=\s*(\S+)",raw,re.M); cid
