@@ -11,7 +11,7 @@ on:
       preset: {description: "SVT preset (lower = slower/smaller)", type: choice, default: "9", options: ["4","5","6","7","8","9","10"]}
       audio_kbps: {description: "Opus kbps (0 = copy original audio)", default: "64", type: string}
       extra: {description: "Extra ffmpeg flags e.g. -g 300 -ac 6 -mapping_family 1", default: "", type: string}
-      destination: {description: "Artifact always uploaded; drive/release are extra", type: choice, default: "drive", options: ["artifact","drive","release","all"]}
+      destination: {description: "drive = raw .mkv to Drive, no zip. artifact = zip backup only", type: choice, default: "drive", options: ["artifact","drive","release","all"]}
 concurrency: {group: video-av1, cancel-in-progress: false}
 defaults: {run: {shell: bash}}
 jobs:
@@ -260,26 +260,20 @@ jobs:
           if [ -s work/notes.txt ]; then { echo ""; echo "### Notes"; echo '```'; cat work/notes.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           if [ -s work/failures.txt ]; then { echo ""; echo "### Failed links"; echo '```'; cat work/failures.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           echo "Settings: ${OUT_HEIGHT}p / fps ${FPS} / CRF ${CRF} / preset ${PRESET} / ${AUDIO_ARGS}" >> "$GITHUB_STEP_SUMMARY"
-      - name: 8. Upload artifact
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: av1-run${{ github.run_number }}
-          path: dist/
-          retention-days: 7
-          compression-level: 0
-          if-no-files-found: warn
-      - name: 9. Google Drive
+      - name: 8. Google Drive (raw files, no zip)
+        id: drive
         if: ${{ inputs.destination == 'drive' || inputs.destination == 'all' }}
         env:
           GDRIVE_TOKEN: ${{ secrets.GDRIVE_TOKEN }}
-          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           export PATH="/usr/local/bin:$PATH"
-          RAW="${GDRIVE_TOKEN:-}"; if [ -z "$RAW" ]; then RAW="${RCLONE_CONFIG:-}"; fi
+          RC="$HOME/.config/rclone/rclone.conf"
+          export RCLONE_CONFIG="$RC"
+          RAW="${GDRIVE_TOKEN:-}"; if [ -z "$RAW" ]; then RAW="${GDRIVE_CONFIG_TEXT:-}"; fi
           if [ -z "$RAW" ]; then echo "ERROR: add secret GDRIVE_TOKEN"; exit 1; fi
           TOK=$(printf '%s' "$RAW" | tr -d '\r\n' | sed 's/^[^{]*//; s/[^}]*$//')
           if [ "${TOK:0:1}" != "{" ] || [ "${TOK: -1}" != "}" ]; then echo "ERROR: secret must contain the {...} token JSON"; exit 1; fi
@@ -293,23 +287,32 @@ jobs:
           if [ -z "$CID" ]; then CID=$(printf '%s\n' "$RAW" | sed -n 's/^ *client_id *= *\([^ ]*\).*/\1/p' | head -n1); fi
           if [ -z "$SEC" ]; then SEC=$(printf '%s\n' "$RAW" | sed -n 's/^ *client_secret *= *\([^ ]*\).*/\1/p' | head -n1); fi
           if [ -n "$SEC" ]; then echo "::add-mask::$SEC"; fi
-          mkdir -p "$HOME/.config/rclone"
-          { echo "[gdrive]"; echo "type = drive"; echo "scope = drive"; if [ -n "$CID" ]; then echo "client_id = $CID"; fi; if [ -n "$SEC" ]; then echo "client_secret = $SEC"; fi; printf 'token = %s\n' "$TOK"; } > "$HOME/.config/rclone/rclone.conf"
-          chmod 600 "$HOME/.config/rclone/rclone.conf"
-          echo "config written"
-          if ! rclone about "gdrive:" > work/acct.txt 2> work/err.txt; then echo "ERROR: rclone auth failed - token invalid or revoked"; sed 's#[A-Za-z0-9_/-]\{30,\}#[REDACTED]#g' work/err.txt; exit 1; fi
+          mkdir -p "$(dirname "$RC")"
+          { echo "[gdrive]"; echo "type = drive"; echo "scope = drive"; if [ -n "$CID" ]; then echo "client_id = $CID"; fi; if [ -n "$SEC" ]; then echo "client_secret = $SEC"; fi; printf 'token = %s\n' "$TOK"; } > "$RC"
+          chmod 600 "$RC"
+          echo "config file ready"
+          if ! rclone --config "$RC" about "gdrive:" > work/acct.txt 2> work/err.txt; then echo "ERROR: rclone auth failed - token invalid or revoked"; sed 's#[A-Za-z0-9_/-]\{30,\}#[REDACTED]#g' work/err.txt; exit 1; fi
           cat work/acct.txt
           echo "DRIVE TARGET FOLDER = [${GDRIVE_FOLDER}]"
-          rclone mkdir "gdrive:${GDRIVE_FOLDER}"
-          rclone copy dist/ "gdrive:${GDRIVE_FOLDER}" --drive-chunk-size 64M --transfers 2 --retries 5 --low-level-retries 10 --stats 1m --stats-one-line -v
-          rclone lsf "gdrive:${GDRIVE_FOLDER}" --files-only > work/remote.txt
+          rclone --config "$RC" mkdir "gdrive:${GDRIVE_FOLDER}"
+          rclone --config "$RC" copy dist/ "gdrive:${GDRIVE_FOLDER}" --drive-chunk-size 64M --transfers 2 --retries 5 --low-level-retries 10 --stats 1m --stats-one-line -v
+          rclone --config "$RC" lsf "gdrive:${GDRIVE_FOLDER}" --files-only > work/remote.txt
           cat work/remote.txt
           MISS=0
           for f in dist/*.mkv; do b=$(basename "$f"); grep -Fxq "$b" work/remote.txt || { echo "MISSING: $b"; MISS=1; }; done
           if [ "$MISS" -ne 0 ]; then echo "ERROR: upload verification failed"; exit 1; fi
-          { echo ""; echo "### Google Drive"; echo "Folder \`${GDRIVE_FOLDER}\` — all files verified"; } >> "$GITHUB_STEP_SUMMARY"
-          FID=$(rclone lsf "gdrive:" --dirs-only --format ip --separator '|' 2>/dev/null | awk -F'|' -v n="${GDRIVE_FOLDER}/" '$2==n{print $1; exit}' || true)
+          { echo ""; echo "### Google Drive"; echo "Folder \`${GDRIVE_FOLDER}\` — raw .mkv files uploaded and verified (no zip)"; } >> "$GITHUB_STEP_SUMMARY"
+          FID=$(rclone --config "$RC" lsf "gdrive:" --dirs-only --format ip --separator '|' 2>/dev/null | awk -F'|' -v n="${GDRIVE_FOLDER}/" '$2==n{print $1; exit}' || true)
           if [ -n "$FID" ]; then echo "Open folder: https://drive.google.com/drive/folders/${FID}" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: 9. Zip backup (ONLY if Drive did not succeed)
+        if: ${{ always() && steps.drive.outcome != 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: av1-run${{ github.run_number }}
+          path: dist/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: warn
       - name: 10. Release
         if: ${{ inputs.destination == 'release' || inputs.destination == 'all' }}
         env:
